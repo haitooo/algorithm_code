@@ -46,6 +46,10 @@ def place_inplace(board: Board, x: int, y: int, player: int) -> Optional[int]:
 def undo_place(board: Board, x: int, y: int, z: int) -> None:
     board[z][y][x] = 0
 
+def stones_count(board: Board) -> int:
+    """盤上の石の総数"""
+    return sum(1 for z in range(SIZE) for y in range(SIZE) for x in range(SIZE) if board[z][y][x] != 0)
+
 # ---------- 勝ち筋（76本） ----------
 def generate_lines() -> List[List[Coord3]]:
     L: List[List[Coord3]] = []
@@ -479,6 +483,14 @@ def choose_best(board: Board, me: int) -> Coord2:
             if after < best_after:
                 best_after = after; best = (x, y)
         return best if best is not None else _center_sorted(moves)[0]
+
+    # ★ Opening corner priority（最初だけ角を最優先）
+    if stones_count(board) <= 8:
+        for (x, y) in CORNERS:
+            if (x, y) in moves and lowest_empty_z(board, x, y) == 0:
+                # 初手/2手目は危険度が低いのでフィルタを緩めるが、t支えだけは避ける
+                if not is_t_support_move(board, me, x, y):
+                    return (x, y)
 
     # 2.3) ★ 脅威だけ浅読み（自殺手/ t支えは除外）
     mv_ts = threat_space_best_move(board, me, max_depth=2)
