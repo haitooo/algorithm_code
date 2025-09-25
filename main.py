@@ -1,5 +1,5 @@
 # main.py
-# 4x4x4 立体四目並べ AI（全76ライン精査＋“側面ターゲット形”優先）
+# 4x4x4 立体四目並べ AI（全76ライン精査＋“側面ターゲット形”＋逆ミッキー優先）
 from typing import List, Tuple, Optional, Dict, Set
 from framework import Alg3D, Board
 
@@ -122,29 +122,22 @@ def column_has_my_stone(board: Board, me: int, x: int, y: int) -> bool:
 
 # ---------- 側面ターゲット形のスコア ----------
 def sideview_required_cells_for_row(y_fixed: int) -> List[Coord3]:
-    # 横から（y固定）見たときの必須6マス: z×x 平面
+    # 横（y固定）: 必須6マス
     return [(0, y_fixed, 0), (3, y_fixed, 0), (1, y_fixed, 1), (2, y_fixed, 1), (1, y_fixed, 2), (2, y_fixed, 2)]
 
 def sideview_required_cells_for_col(x_fixed: int) -> List[Coord3]:
-    # 横から（x固定）見たときの必須6マス: z×y 平面
+    # 横（x固定）: 必須6マス
     return [(x_fixed, 0, 0), (x_fixed, 3, 0), (x_fixed, 1, 1), (x_fixed, 2, 1), (x_fixed, 1, 2), (x_fixed, 2, 2)]
 
 def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> int:
-    """
-    (x,y) に仮置き後、その行/列の側面ビューにおけるターゲット形の
-    “自分石で埋まっている必須セル数”を返す。必須セルに相手石があれば 0（優先しない）。
-    """
     you = 3 - me
     z = place_inplace(board, x, y, me)
-    # 方向判定：辺セルなので x==0 or 3 か y==0 or 3 のどちらか
     if y in (0, 3):
         req = sideview_required_cells_for_row(y)
     else:
         req = sideview_required_cells_for_col(x)
-
     opp_block = any(board[zz][yy][xx] == you for (xx, yy, zz) in req)
     score = 0 if opp_block else sum(1 for (xx, yy, zz) in req if board[zz][yy][xx] == me)
-
     undo_place(board, x, y, z)
     return score
 
@@ -177,6 +170,26 @@ def choose_best(board: Board, me: int) -> Coord2:
                 best_after = after; best = (x, y)
         return best if best is not None else moves[0]
 
+    # 2.5) 逆ミッキー型（ダブルスレット作成）最優先
+    #  置いた直後に「自分の即勝ち手」が2本以上 & 相手の即勝ちが0 なら採用。
+    best_rm_move: Optional[Coord2] = None
+    best_dt = 0
+    best_tie = -1
+    for (x, y) in moves:
+        z = place_inplace(board, x, y, me)
+        my_next = len(line_immediate_winning_moves(board, me))
+        opp_next = len(line_immediate_winning_moves(board, you))
+        # タイブレークに“側面ターゲット形スコア”を使用（特に辺で効く）
+        tie = sideview_pattern_score_after_move(board, me, x, y) if (x, y) in EDGES else 0
+        undo_place(board, x, y, z)
+        if my_next >= 2 and opp_next == 0:
+            if my_next > best_dt or (my_next == best_dt and tie > best_tie):
+                best_dt = my_next
+                best_tie = tie
+                best_rm_move = (x, y)
+    if best_rm_move is not None:
+        return best_rm_move
+
     # 3) 角 {0,4,D,G} の 1層目
     for (x, y) in CORNERS:
         if (x, y) in moves and lowest_empty_z(board, x, y) == 0:
@@ -199,13 +212,11 @@ def choose_best(board: Board, me: int) -> Coord2:
                 corners = row_col_corners_for_edge(x, y)
                 if any(column_has_my_stone(board, me, cx, cy) for (cx, cy) in corners):
                     edge_cands.append((x, y))
-
     if edge_cands:
         best_mv = edge_cands[0]
         best_score = -1
         for (x, y) in edge_cands:
             sc = sideview_pattern_score_after_move(board, me, x, y)
-            # スコアが高いほど、あの「・11・ / 1・・1」の形に近い
             if sc > best_score:
                 best_score = sc
                 best_mv = (x, y)
