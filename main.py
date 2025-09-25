@@ -1,12 +1,8 @@
 # main.py
-# 4x4x4 立体四目並べ AI — 10秒制限向け“実戦最強”エンジン
-# 技法: 反復深化 / PVS(Principal Variation Search) / Aspiration Window /
-#       Transposition Table / Killer Moves / History Heuristic / 静止探索(タクティクス限定)
-# 依存: framework.Alg3D, Board  (get_move(board, player, last_move) -> (x,y))
+# 4x4x4 立体四目並べ AI — 10秒制限向け“実戦最強”エンジン（安定性修正版）
 
 from typing import List, Tuple, Optional, Dict
 import time
-import math
 from framework import Alg3D, Board
 
 Coord2 = Tuple[int, int]
@@ -17,22 +13,23 @@ SIZE = 4
 TIME_BUDGET_SEC = 9.5
 NODE_BUDGET     = 220_000
 
-# ---- 評価重み（調整済み）----
+# ---- 評価重み ----
 WIN_SCORE      = 1_000_000
-PATTERN_0_3    = 120     # 自3/相0 の3連
-PATTERN_0_2    = 10      # 自2/相0
-PATTERN_0_1    = 1       # 自1/相0
-TPOINT_BONUS   = 120     # z==3 で完成する“浮き”リーチの上乗せ
-CENTER_COL_BON = 4       # 2D中心寄り（列の上段が空のときのみ軽く）
-DOUBLE_THREAT  = 5_000   # 即勝ち手が2つ以上
+PATTERN_0_3    = 120
+PATTERN_0_2    = 10
+PATTERN_0_1    = 1
+TPOINT_BONUS   = 120
+CENTER_COL_BON = 4
+DOUBLE_THREAT  = 5_000
 OPP_DTH_PEN    = 5_000
 
 # ---- 探索制御 ----
 INF  = 10**9
-PV_BIAS = 16             # PVSで再探索を減らすバイアス
-QUIES_DEPTH = 2          # 静止探索の最大深さ
-BEAM_ROOT = 14           # ルートのビーム幅（序中盤の分岐抑制）
-BEAM_NODE = 10           # ノードのビーム幅
+PV_BIAS = 16
+QUIES_DEPTH = 2
+BEAM_ROOT = 14
+BEAM_NODE = 10
+ASP_MAX_EXPAND = 3   # Aspirationの窓拡張回数上限
 
 # ---------------- 盤ユーティリティ ----------------
 def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
@@ -92,18 +89,14 @@ def generate_lines() -> List[List[Coord3]]:
     return L
 
 ALL_LINES = generate_lines()
-CENTERS_2D = {(1,1), (2,1), (1,2), (2,2)}
 
 # ---------------- 終局・即勝ち ----------------
 def check_win_at(board: Board, player: int, last: Coord3) -> bool:
     lx, ly, lz = last
     for line in ALL_LINES:
-        hit = False
-        for (x,y,z) in line:
-            if x==lx and y==ly and z==lz:
-                hit = True; break
-        if hit and all(board[z][y][x] == player for (x,y,z) in line):
-            return True
+        if any((x==lx and y==ly and z==lz) for (x,y,z) in line):
+            if all(board[z][y][x] == player for (x,y,z) in line):
+                return True
     return False
 
 def is_winning_after(board: Board, player: int, x: int, y: int) -> bool:
@@ -176,8 +169,8 @@ def eval_board(board: Board, me: int, ply: int) -> int:
 # ---------------- 並べ替えヒューリスティクス ----------------
 class MoveOrderer:
     def __init__(self):
-        self.killers: Dict[int, List[Coord2]] = {}    # depth -> top2 killers
-        self.history: Dict[Coord2, int] = {}          # quiet move → score
+        self.killers: Dict[int, List[Coord2]] = {}
+        self.history: Dict[Coord2, int] = {}
 
     def note_killer(self, depth: int, mv: Coord2):
         ks = self.killers.get(depth, [])
@@ -200,7 +193,6 @@ class MoveOrderer:
             if mv in blk_set:  s += 800_000
             if mv in ks:       s += 100_000
             s += self.history.get(mv, 0)
-            # 2D中心寄りの微加点（等価手の順序安定）
             cx = abs(1.5 - mv[0]); cy = abs(1.5 - mv[1])
             s += int(1000 * (1.5 - (cx+cy)/2))
             table.append((s, mv))
@@ -219,7 +211,7 @@ class Searcher:
         self.nodes = 0
         self.tt: Dict[Tuple, TTEntry] = {}
         self.mo = MoveOrderer()
-        self.pv: Dict[int, Coord2] = {}  # 深さ→PV第一手
+        self.pv: Dict[int, Coord2] = {}
 
     def time_up(self) -> bool:
         return self.nodes >= NODE_BUDGET or time.perf_counter() >= self.deadline
@@ -227,7 +219,7 @@ class Searcher:
     def key(self, board: Board, turn: int) -> Tuple:
         return (turn, tuple(tuple(tuple(board[z][y][x] for x in range(SIZE)) for y in range(SIZE)) for z in range(SIZE)))
 
-    # ---- 静止探索（即勝/即負け/リーチのみの簡易延長）----
+    # ---- 静止探索 ----
     def qsearch(self, board: Board, alpha: int, beta: int, turn: int, ply: int, qd: int) -> int:
         if self.time_up(): return eval_board(board, self.me, ply)
         self.nodes += 1
@@ -240,14 +232,12 @@ class Searcher:
         moves = valid_xy_moves(board)
         if not moves: return stand
 
-        # タクティカル候補のみ: 自即勝、相手即勝ブロック、相手リーチ減
         you = 3 - turn
         wins  = [mv for mv in moves if is_winning_after(board, turn, mv[0], mv[1])]
         blks  = immediate_winning_squares(board, you)
         blks_set = set(blks)
         tactical = set(wins) | blks_set
 
-        # 追加: 相手の即勝ち数を減らす手
         before = len(blks)
         for (x,y) in moves:
             z = place_inplace(board, x, y, turn)
@@ -259,7 +249,6 @@ class Searcher:
         if not tactical: return stand
 
         ordered = list(tactical)
-        # 自即勝は先に
         ordered.sort(key=lambda mv: (mv not in wins, mv not in blks_set))
 
         for (x,y) in ordered:
@@ -271,15 +260,13 @@ class Searcher:
         return alpha
 
     # ---- PVS αβ ----
-    def pvs(self, board: Board, depth: int, alpha: int, beta: int, turn: int, ply: int, root: bool, d_rem: int) -> int:
+    def pvs(self, board: Board, depth: int, alpha: int, beta: int, turn: int, ply: int, root: bool) -> int:
         if self.time_up(): return eval_board(board, self.me, ply)
         self.nodes += 1
 
-        # 終深
         if depth == 0:
             return self.qsearch(board, alpha, beta, turn, ply, QUIES_DEPTH)
 
-        # 終了＆即勝刈り取り
         moves = valid_xy_moves(board)
         if not moves:
             return eval_board(board, self.me, ply)
@@ -288,37 +275,34 @@ class Searcher:
             if is_winning_after(board, turn, x, y):
                 return WIN_SCORE - ply if turn == self.me else -WIN_SCORE + ply
 
-        # TT 参照
         key = self.key(board, turn)
-        tt_hit = self.tt.get(key)
-        tt_mv: Optional[Coord2] = tt_hit[3] if tt_hit and tt_hit[0] >= depth else None
+        tte = self.tt.get(key)
+        tt_mv: Optional[Coord2] = tte[3] if tte and tte[0] >= depth else None
 
-        # 自即勝/相手即勝ブロック列挙（順序に反映）
         you = 3 - turn
         wins = [mv for mv in moves if is_winning_after(board, turn, mv[0], mv[1])]
         blks = immediate_winning_squares(board, you)
 
-        # 並べ替え＋ビーム
         ordered = [mv for _,mv in self.mo.score(tt_mv, wins, blks, depth, moves)]
         beam = BEAM_ROOT if root else BEAM_NODE
-        ordered = ordered[:beam]
+        if not ordered:
+            ordered = moves[:]  # 念のため
+        ordered = ordered[:max(1, min(beam, len(ordered)))]
 
         best = -INF
         best_mv: Optional[Coord2] = None
         first = True
+        alpha0, beta0 = alpha, beta  # ← TTフラグ用
 
         for (x,y) in ordered:
             z = place_inplace(board, x, y, turn)
-
             if first:
-                score = -self.pvs(board, depth-1, -beta, -alpha, 3-turn, ply+1, False, d_rem-1)
+                score = -self.pvs(board, depth-1, -beta, -alpha, 3-turn, ply+1, False)
                 first = False
             else:
-                # PVS: null-window で試し、越えたら本窓で再探索
-                score = -self.pvs(board, depth-1, -(alpha+1), -alpha, 3-turn, ply+1, False, d_rem-1)
+                score = -self.pvs(board, depth-1, -(alpha+1), -alpha, 3-turn, ply+1, False)
                 if score > alpha and score < beta:
-                    score = -self.pvs(board, depth-1, -beta, -alpha, 3-turn, ply+1, False, d_rem-1)
-
+                    score = -self.pvs(board, depth-1, -beta, -alpha, 3-turn, ply+1, False)
             undo_place(board, x, y, z)
 
             if score > best:
@@ -328,27 +312,27 @@ class Searcher:
 
             if best > alpha:
                 alpha = best
-
             if alpha >= beta:
-                # カット：キラー＆ヒストリー更新（安静手のみ）
                 if (x,y) not in wins and (x,y) not in blks:
                     self.mo.note_killer(depth, (x,y))
                     self.mo.bump_history((x,y), depth)
                 break
 
-        # TT 保存
+        # TT 保存（正しく alpha0/beta0 で判定）
         flag = 0
-        if best <= -INF//2: flag = -1
-        elif best <= alpha: flag = -1
-        elif best >= beta:  flag = +1
+        if best <= alpha0: flag = -1     # UPPER
+        elif best >= beta0: flag = +1    # LOWER
+        else: flag = 0                   # EXACT
         self.tt[key] = (depth, best, flag, best_mv)
         return best
 
 # ---------------- ルート選択（反復深化＋アスピレーション） ----------------
 def choose_best(board: Board, me: int) -> Coord2:
     moves = valid_xy_moves(board)
-    if not moves: return (0,0)
-    # 即勝ち先取り
+    if not moves:
+        return (0, 0)  # 盤面が詰んでいる場合の保険（フレームワーク互換）
+
+    # 即勝ち先取り（ここで返せば安全）
     for (x,y) in moves:
         if is_winning_after(board, me, x, y):
             return (x,y)
@@ -356,36 +340,35 @@ def choose_best(board: Board, me: int) -> Coord2:
     deadline = time.perf_counter() + TIME_BUDGET_SEC
     search = Searcher(me, deadline)
 
-    # 初期並べ替え（軽いスコアで降順）→ ルートビーム
-    base_scores = []
+    # 初期並べ替え（軽評価）→ ルートビーム
+    scored: List[Tuple[int, Coord2]] = []
     for (x,y) in moves:
         z = place_inplace(board, x, y, me)
         s = eval_board(board, me, 1)
         undo_place(board, x, y, z)
-        base_scores.append((s, (x,y)))
-    base_scores.sort(reverse=True)
-    root_moves = [mv for _,mv in base_scores[:BEAM_ROOT]]
+        scored.append((s, (x,y)))
+    scored.sort(reverse=True)
+    root_moves = [mv for _,mv in scored[:max(1, min(BEAM_ROOT, len(scored)))]]
 
     best_move = root_moves[0]
     guess = 0
-    max_depth = 6 if stones_count(board) >= 20 else 5  # 終盤は少し深く
+    # 終盤は少し深く（ただし時間制御あり）
+    max_depth = 6 if stones_count(board) >= 20 else 5
+
     for depth in range(1, max_depth+1):
         if search.time_up(): break
         alpha = guess - PV_BIAS
         beta  = guess + PV_BIAS
         local_best = best_move
-        local_score = -INF
+        expand_cnt = 0
 
-        # Aspiration loop
         while True:
             if search.time_up(): break
             score = -INF
-            # ルートPVS
-            first = True
             for (x,y) in root_moves:
                 if search.time_up(): break
                 z = place_inplace(board, x, y, me)
-                val = -search.pvs(board, depth-1, -beta, -alpha, 3-me, 1, True, depth-1)
+                val = -search.pvs(board, depth-1, -beta, -alpha, 3-me, 1, True)
                 undo_place(board, x, y, z)
                 if val > score:
                     score = val
@@ -394,16 +377,14 @@ def choose_best(board: Board, me: int) -> Coord2:
                     alpha = score
                 if alpha >= beta:
                     break
-                first = False
 
-            # アスピレーション失敗 → 窓を広げて再試行
-            if score <= guess - PV_BIAS:
-                alpha = -INF; beta = guess + PV_BIAS
-                if alpha <= -INF and beta >= INF: break
+            # Aspiration調整（上限付き）
+            if score <= guess - PV_BIAS and expand_cnt < ASP_MAX_EXPAND:
+                alpha = -INF; beta = guess + PV_BIAS; expand_cnt += 1
                 guess = score
                 continue
-            elif score >= guess + PV_BIAS:
-                alpha = guess - PV_BIAS; beta = INF
+            elif score >= guess + PV_BIAS and expand_cnt < ASP_MAX_EXPAND:
+                alpha = guess - PV_BIAS; beta = INF; expand_cnt += 1
                 guess = score
                 continue
             else:
@@ -413,11 +394,25 @@ def choose_best(board: Board, me: int) -> Coord2:
         if not search.time_up():
             best_move = local_best
 
+    # 念のための最終ガード：必ず合法手を返す
+    if best_move not in moves:
+        return moves[0]
     return best_move
 
 # ---------------- エンジン ----------------
 class MyAI(Alg3D):
     def get_move(self, board: Board, player: int, last_move: Coord3) -> Coord2:
-        return choose_best(board, player)
+        # いかなる例外でも合法手を返す
+        try:
+            start = time.perf_counter()
+            mv = choose_best(board, player)
+            # 万一の時間オーバーに備えた最終ガード
+            if time.perf_counter() - start > TIME_BUDGET_SEC:
+                ms = valid_xy_moves(board)
+                return ms[0] if ms else (0,0)
+            return mv
+        except Exception:
+            ms = valid_xy_moves(board)
+            return ms[0] if ms else (0,0)
 
 AI = MyAI()
