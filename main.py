@@ -1,6 +1,6 @@
 # main.py
 # 提出仕様に準拠: Python 3.9互換 / 標準ライブラリのみ / get_move(board, player, last_move)
-# from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional
 from framework import Alg3D, Board  # 本番用（local_driverと同じシグネチャに揃える）
 
 Coord = Tuple[int, int, int]  # (x, y, z)
