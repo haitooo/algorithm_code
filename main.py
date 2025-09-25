@@ -1,11 +1,11 @@
 # main.py
-# 4x4x4 立体四目並べ AI（10秒制限対応版）
-# - 3手定石
-# - 反復深化 + 時間/ノード制限
-# - Move ordering + ビーム（上位Kのみ深掘り）
-# - 即勝ち/即ブロック/ダブルリーチの優先
-from typing import List, Tuple, Optional, Dict
-import time
+# 4x4x4 立体四目並べ AI（軽量リセット版）
+# 方針:
+#  - 即勝ち、即負けブロック、序盤定石は従来どおり
+#  - 以降は「自分の二連(open-2)を最大化」する貪欲選択でダブルチェインを狙う
+#  - 重い全探索はしない（1手だけ仮置き評価）
+
+from typing import List, Tuple, Optional
 
 from framework import Alg3D, Board
 
@@ -14,24 +14,13 @@ Coord3 = Tuple[int, int, int]   # (x, y, z)
 
 SIZE = 4
 
-WIN_SCORE      = 1_000_000
-DOUBLE_THREAT  = 5_000
-TPOINT_BONUS   = 150
-CENTER_BONUS   = 5
-
-# ---- タイム/ノード制御 ----
-TIME_BUDGET_SEC   = 9.5       # 呼び出し側が10秒なら安全マージン
-NODE_BUDGET       = 180_000   # 上限ノード（安全ネット）
-
-# 盤面状況で深さとビーム幅を調整
-def depth_and_beam(stones: int) -> Tuple[int, int]:
-    # stones: 置かれている石の総数
-    if stones <= 4:         # 序盤（分岐大）→浅く・広く
-        return 3, 10
-    if stones <= 24:        # 中盤
-        return 2, 8
-    else:                   # 終盤（分岐減）→少し深く
-        return 3, 12
+# 軽量ヒューリスティック定数
+WIN_SCORE       = 1_000_000
+OPEN2_WEIGHT    = 200          # 自分の open-2 の重み（ダブルチェイン狙いの主眼）
+OPEN3_WEIGHT    = 800          # 自分の open-3（リーチ）重み（即勝ちの一歩手前）
+BLOCK_OPEN3_W   = 700          # 相手の open-3 を減らす効果（ブロック価値）
+CENTER_BONUS    = 4            # 中央寄り
+TPOINT_BONUS    = 60           # t点(z==3) の二連/三連に少し上乗せ
 
 # ---------------- 基本ユーティリティ ----------------
 def clone(board: Board) -> Board:
@@ -116,6 +105,7 @@ def is_winning_after(board: Board, player: int, x: int, y: int) -> bool:
 def check_win_at(board: Board, player: int, last: Coord3) -> bool:
     lx, ly, lz = last
     for line in ALL_LINES:
+        # last を含むラインだけ確認
         includes_last = False
         for (x, y, z) in line:
             if x == lx and y == ly and z == lz:
@@ -128,182 +118,51 @@ def check_win_at(board: Board, player: int, last: Coord3) -> bool:
 def immediate_winning_squares(board: Board, player: int) -> List[Coord2]:
     return [(x, y) for (x, y) in valid_xy_moves(board) if is_winning_after(board, player, x, y)]
 
-def count_immediate_wins(board: Board, player: int) -> int:
-    return len(immediate_winning_squares(board, player))
+# ---------------- open-2 / open-3 計数（重力を考慮） ----------------
+def line_status(board: Board, player: int, line: List[Coord3]) -> Tuple[int,int,List[Coord3]]:
+    """そのライン内の (自分石数, 相手石数, 空きセル一覧) を返す"""
+    you = 3 - player
+    pm = py = 0
+    empties: List[Coord3] = []
+    for (x,y,z) in line:
+        v = board[z][y][x]
+        if v == player: pm += 1
+        elif v == you:  py += 1
+        else: empties.append((x,y,z))
+    return pm, py, empties
 
-# --- 評価関数 ---
-def eval_board(board: Board, me: int, ply: int) -> int:
-    you = 3 - me
+def is_legal_empty(board: Board, e: Coord3) -> bool:
+    x, y, z = e
+    ze = lowest_empty_z(board, x, y)
+    return (ze is not None) and (ze == z)
 
-    # 終局
-    if any(all(board[z][y][x] == me  for (x,y,z) in line) for line in ALL_LINES):
-        return WIN_SCORE - ply
-    if any(all(board[z][y][x] == you for (x,y,z) in line) for line in ALL_LINES):
-        return -WIN_SCORE + ply
-
-    score = 0
-    table = [0, 1, 10, 120]   # 3連は大きめ。t点でさらに上乗せ
-
+def count_open2_open3(board: Board, player: int) -> Tuple[int, int, int, int]:
+    """
+    戻り値: (open2数, t点open2数, open3数, t点open3数)
+      open2: 自分2石+空2、相手石0、かつ空2マスが合法位置（重力OK）
+      open3: 自分3石+空1、相手石0、かつ空1マスが合法位置
+    """
+    open2 = open2_t = open3 = open3_t = 0
     for line in ALL_LINES:
-        cnt_me = cnt_you = 0
-        empties: List[Coord3] = []
-        for (x,y,z) in line:
-            v = board[z][y][x]
-            if v == me:
-                cnt_me += 1
-            elif v == you:
-                cnt_you += 1
-            else:
-                empties.append((x,y,z))
-
-        if cnt_you == 0:
-            score += table[cnt_me]
-            if cnt_me == 3:
-                e = empties[0]
-                x, y, z = e
-                ze = lowest_empty_z(board, x, y)
-                if ze is not None and ze == z and z == 3:
-                    score += TPOINT_BONUS
-        if cnt_me == 0:
-            score -= table[cnt_you]
-            if cnt_you == 3:
-                e = empties[0]
-                x, y, z = e
-                ze = lowest_empty_z(board, x, y)
-                if ze is not None and ze == z and z == 3:
-                    score -= TPOINT_BONUS
-
-    # 位置ボーナス（中心寄り）
-    top = SIZE - 1
-    for y in range(SIZE):
-        for x in range(SIZE):
-            if board[top][y][x] == 0:
-                cx = abs(1.5 - x)
-                cy = abs(1.5 - y)
-                score += int(CENTER_BONUS * (1.5 - (cx + cy) / 2))
-
-    # ダブルリーチ加点/減点
-    my_wins  = count_immediate_wins(board, me)
-    you_wins = count_immediate_wins(board, you)
-    if my_wins  >= 2: score += DOUBLE_THREAT
-    if you_wins >= 2: score -= DOUBLE_THREAT
-
-    return score
-
-# --- 着手並べ替え（即勝ち / ダブルリーチ / ブロック / その他） ---
-def order_moves(board: Board, me: int, moves: List[Coord2]) -> List[Coord2]:
-    wins = []
-    double_threats = []
-    blocks = []
-    rest = []
-    you = 3 - me
-
-    before_threats = count_immediate_wins(board, you)
-
-    for (x, y) in moves:
-        # 自分の即勝ち
-        if is_winning_after(board, me, x, y):
-            wins.append((x, y))
+        me, you, empties = line_status(board, player, line)
+        if you != 0:
             continue
+        if me == 2 and len(empties) == 2:
+            # 2つの空きが両方合法に打てる列か
+            legal = is_legal_empty(board, empties[0]) and is_legal_empty(board, empties[1])
+            if legal:
+                open2 += 1
+                # t点（いずれかが z==3）を少し評価
+                if empties[0][2] == 3 or empties[1][2] == 3:
+                    open2_t += 1
+        elif me == 3 and len(empties) == 1:
+            if is_legal_empty(board, empties[0]):
+                open3 += 1
+                if empties[0][2] == 3:
+                    open3_t += 1
+    return open2, open2_t, open3, open3_t
 
-        z = place_inplace(board, x, y, me)
-        my_wins_after = count_immediate_wins(board, me)
-        opp_after = count_immediate_wins(board, you)
-        undo_place(board, x, y, z)
-
-        if my_wins_after >= 2:
-            double_threats.append((x, y))
-        elif before_threats > 0 and opp_after < before_threats:
-            blocks.append((x, y))
-        else:
-            rest.append((x, y))
-
-    return wins + double_threats + blocks + rest
-
-# ===== 反復深化 + 時間/ノード制御 αβ =====
-class Searcher:
-    def __init__(self, me: int, max_depth: int, beam_width: int, deadline: float, node_budget: int):
-        self.me = me
-        self.max_depth = max_depth
-        self.beam_width = beam_width
-        self.deadline = deadline
-        self.node_budget = node_budget
-        self.nodes = 0
-        self.tt: Dict[Tuple, Tuple[int,int,int]] = {}
-        # key -> (depth_remaining, value, flag)
-        # flag: 0=exact, -1=upperbound, +1=lowerbound
-
-    def time_up(self) -> bool:
-        return (self.nodes >= self.node_budget) or (time.perf_counter() >= self.deadline)
-
-    def key_of(self, board: Board, turn: int) -> Tuple:
-        # 盤面をタプル化（Zobristほど速くないが十分軽量）
-        return (turn, tuple(tuple(tuple(board[z][y][x] for x in range(SIZE)) for y in range(SIZE)) for z in range(SIZE)))
-
-    def minimax(self, board: Board, depth: int, alpha: int, beta: int, turn: int, ply: int) -> int:
-        if self.time_up():
-            return eval_board(board, self.me, ply)  # 打ち切り評価
-
-        self.nodes += 1
-        moves = valid_xy_moves(board)
-
-        if depth == 0 or not moves:
-            return eval_board(board, self.me, ply)
-
-        # 即勝ち刈り取り
-        for (x, y) in moves:
-            if is_winning_after(board, turn, x, y):
-                return WIN_SCORE - ply if turn == self.me else -WIN_SCORE + ply
-
-        # TT
-        key = self.key_of(board, turn)
-        entry = self.tt.get(key)
-        if entry and entry[0] >= depth:
-            val, flag = entry[1], entry[2]
-            if flag == 0:
-                return val
-            if flag == -1 and val <= alpha:
-                return val
-            if flag == +1 and val >= beta:
-                return val
-
-        # 並べ替え + ビーム
-        ordered = order_moves(board, turn, moves)[:self.beam_width]
-
-        if turn == self.me:
-            best = -10**9
-            a0 = alpha
-            for (x, y) in ordered:
-                z = place_inplace(board, x, y, turn)
-                val = self.minimax(board, depth-1, alpha, beta, 3-turn, ply+1)
-                undo_place(board, x, y, z)
-                if val > best: best = val
-                if best > alpha: alpha = best
-                if alpha >= beta: break
-            # TT 保存
-            flag = 0
-            if best <= a0: flag = -1
-            elif best >= beta: flag = +1
-            self.tt[key] = (depth, best, flag)
-            return best
-        else:
-            best = 10**9
-            b0 = beta
-            for (x, y) in ordered:
-                z = place_inplace(board, x, y, turn)
-                val = self.minimax(board, depth-1, alpha, beta, 3-turn, ply+1)
-                undo_place(board, x, y, z)
-                if val < best: best = val
-                if best < beta: beta = best
-                if alpha >= beta: break
-            # TT 保存
-            flag = 0
-            if best >= b0: flag = +1
-            elif best <= alpha: flag = -1
-            self.tt[key] = (depth, best, flag)
-            return best
-
-# --- 定石（最初の3手） ---
+# ---------------- 定石（最初の3手：そのまま） ----------------
 def opening_move(board: Board, player: int) -> Optional[Coord2]:
     n = stones_count(board)
     if n == 0 and player == 1:
@@ -318,7 +177,44 @@ def opening_move(board: Board, player: int) -> Optional[Coord2]:
                 return (x, y)
     return None
 
-# --- ルートでの最善選択（反復深化） ---
+# ---------------- 1手仮置き評価（ダブルチェイン重視） ----------------
+def move_score(board: Board, me: int, x: int, y: int) -> int:
+    """
+    1手だけ仮置きして、二連(open-2)の“数”を最優先で評価。
+    タイブレークに open-3（自分優先・相手妨害）、中心寄り、t点ボーナス。
+    """
+    you = 3 - me
+
+    # 即勝ちは別ハンドリングだが、ここでも一応巨大加点（保険）
+    if is_winning_after(board, me, x, y):
+        return WIN_SCORE
+
+    z = place_inplace(board, x, y, me)
+
+    # 自分の open-2 / open-3
+    my_o2, my_o2_t, my_o3, my_o3_t = count_open2_open3(board, me)
+    # 相手の open-3（こちらの着手により減っていれば、その分を加点として扱う）
+    opp_o2, opp_o2_t, opp_o3, opp_o3_t = count_open2_open3(board, you)
+
+    undo_place(board, x, y, z)
+
+    # 中央ボーナス（軽め）
+    cx = abs(1.5 - x)
+    cy = abs(1.5 - y)
+    center = int(CENTER_BONUS * (1.5 - (cx + cy) / 2))
+
+    # 総合スコア
+    score  = 0
+    score += OPEN2_WEIGHT * my_o2 + TPOINT_BONUS * my_o2_t
+    score += OPEN3_WEIGHT * my_o3 + (TPOINT_BONUS // 2) * my_o3_t
+    score += center
+    # 相手 open-3 が多い局面は危険 → 減点（=ブロック価値）
+    score -= BLOCK_OPEN3_W * opp_o3
+    score -= (TPOINT_BONUS // 2) * opp_o3_t
+
+    return score
+
+# ---------------- ルート選択 ----------------
 def choose_best(board: Board, me: int) -> Coord2:
     # 0) 定石
     mv = opening_move(board, me)
@@ -330,75 +226,40 @@ def choose_best(board: Board, me: int) -> Coord2:
         if is_winning_after(board, me, x, y):
             return (x, y)
 
-    # 2) 相手の即勝ちブロック：即勝ち手の数を最小化
+    # 2) 相手の即勝ちブロック（相手の1手勝ち手があれば最優先で消す）
     you = 3 - me
-    opp_wins_now = immediate_winning_squares(board, you)
-    if opp_wins_now:
+    opp_wins = immediate_winning_squares(board, you)
+    if opp_wins:
+        # 複数ある場合は、ブロックしたうえで自分のスコアが最大になる手を選ぶ
         best_move = None
-        best_after = 10**9
-        for (x, y) in valid_xy_moves(board):
-            z = place_inplace(board, x, y, me)
-            after = len(immediate_winning_squares(board, you))
-            undo_place(board, x, y, z)
-            if after < best_after:
-                best_after = after
-                best_move = (x, y)
-                if after == 0:
-                    break
+        best_val  = -10**9
+        for (bx, by) in opp_wins:
+            # ブロック可能か確認（その列が合法に置ける）
+            if lowest_empty_z(board, bx, by) is None:
+                continue
+            val = move_score(board, me, bx, by)
+            if val > best_val:
+                best_val = val
+                best_move = (bx, by)
         if best_move is not None:
             return best_move
 
-    # 3) ダブルリーチ作成手
-    cand = []
+    # 3) ダブルチェイン狙い：open-2 の“数”を最大化する手を選ぶ
+    best = None
+    best_sc = -10**9
     for (x, y) in valid_xy_moves(board):
-        z = place_inplace(board, x, y, me)
-        k = count_immediate_wins(board, me)
-        undo_place(board, x, y, z)
-        if k >= 2:
-            cand.append((x, y))
-    if cand:
-        return cand[0]
+        sc = move_score(board, me, x, y)
+        if sc > best_sc:
+            best_sc = sc
+            best = (x, y)
 
-    # 4) 反復深化（時間/ノード制限）
-    stones = stones_count(board)
-    max_depth, beam = depth_and_beam(stones)
-    deadline = time.perf_counter() + TIME_BUDGET_SEC
-    search = Searcher(me, max_depth, beam, deadline, NODE_BUDGET)
+    # 4) 念のためのフォールバック（中央寄り）
+    if best is None:
+        cx_order = sorted(valid_xy_moves(board), key=lambda p: (abs(1.5-p[0]) + abs(1.5-p[1])))
+        best = cx_order[0]
+    return best
 
-    root_moves = order_moves(board, me, valid_xy_moves(board))
-    root_moves = root_moves[:beam]  # ルートでもビーム
-
-    best_move = root_moves[0] if root_moves else (1, 1)
-    best_val  = -10**9
-
-    # 深さ1→max_depth と段階的に深く（間に合った最後の結果を採用）
-    for depth in range(1, max_depth + 1):
-        if search.time_up():
-            break
-        local_best_move = best_move
-        local_best_val  = -10**9
-        alpha, beta = -10**9, 10**9
-
-        for (x, y) in root_moves:
-            if search.time_up():
-                break
-            z = place_inplace(board, x, y, me)
-            val = search.minimax(board, depth-1, alpha, beta, 3-me, 1)
-            undo_place(board, x, y, z)
-            if val > local_best_val:
-                local_best_val = val
-                local_best_move = (x, y)
-
-        # 深さ depth を完了できたら更新
-        if not search.time_up():
-            best_move = local_best_move
-            best_val  = local_best_val
-        else:
-            break
-
-    return best_move
-
-# --- エンジン ---
+# ---------------- エンジン ----------------
 class MyAI(Alg3D):
     def get_move(self, board: Board, player: int, last_move: Coord3) -> Coord2:
         return choose_best(board, player)
