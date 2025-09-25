@@ -1,21 +1,46 @@
-# main.py  —  角→対角→即勝ち→ブロック→ダブトリ→形（軽量版）
-from typing import List, Tuple, Optional, Iterable
-from framework import Alg3D, Board  # 本番用
+# main.py
+# 4x4x4 立体四目並べ AI
+# 方針（qweral記事を反映）
+# 1) 終局・1手勝ち・相手の1手勝ちブロックを最優先
+# 2) ダブルリーチ（次手で勝ち手が2つ以上になる手）を強く評価
+# 3) パターン認識ベースの評価関数（相手石混入ラインは無効化、空き含む自分/相手カウント）
+# 4) t点（floatingリーチの空きマスが z==3）ボーナス
+# 5) 中央寄り優先の軽い位置ボーナス（序盤寄与）
+#
+# 依存: framework.Alg3D, Board
+# 引数: get_move(board, player, last_move) -> (x, y)
 
-Coord = Tuple[int, int, int]  # (x, y, z)
+from typing import List, Tuple, Optional
+from framework import Alg3D, Board
 
-# ============== 基本ユーティリティ（安全：盤面コピー） ==============
+Coord2 = Tuple[int, int]        # (x, y)
+Coord3 = Tuple[int, int, int]   # (x, y, z)
+
+SIZE = 4
+PLAYERS = (1, 2)
+
+WIN_SCORE      = 1_000_000
+DOUBLE_THREAT  = 5_000   # qweral更新記事での調整方針に合わせる
+TPOINT_BONUS   = 150      # t点(z==3)の浮きリーチを加点
+CENTER_BONUS   = 5        # 位置ボーナス（序盤寄与）
+DEPTH_DEFAULT  = 3        # 計算量と安定性のバランス
+
 def clone(board: Board) -> Board:
     return [[row[:] for row in plane] for plane in board]
 
 def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
-    for z in range(4):
+    for z in range(SIZE):
         if board[z][y][x] == 0:
             return z
     return None
 
-def column_has_space(board: Board, x: int, y: int) -> bool:
-    return board[3][y][x] == 0
+def valid_xy_moves(board: Board) -> List[Coord2]:
+    ms: List[Coord2] = []
+    for y in range(SIZE):
+        for x in range(SIZE):
+            if board[SIZE-1][y][x] == 0:
+                ms.append((x, y))
+    return ms
 
 def place_inplace(board: Board, x: int, y: int, player: int) -> Optional[int]:
     z = lowest_empty_z(board, x, y)
@@ -24,279 +49,280 @@ def place_inplace(board: Board, x: int, y: int, player: int) -> Optional[int]:
     board[z][y][x] = player
     return z
 
-def legal_cols(board: Board) -> Iterable[Tuple[int, int]]:
-    for x in range(4):
-        for y in range(4):
-            if column_has_space(board, x, y):
-                yield (x, y)
+def undo_place(board: Board, x: int, y: int, z: int) -> None:
+    board[z][y][x] = 0
 
-def count_bits(board: Board) -> int:
-    c = 0
-    for z in range(4):
-        for y in range(4):
-            for x in range(4):
-                if board[z][y][x] != 0:
-                    c += 1
-    return c
+# --- 勝ち筋（4連）ラインの全列挙（76本）
+def generate_lines() -> List[List[Coord3]]:
+    lines: List[List[Coord3]] = []
 
-# ============== 勝ち筋（76本） ==============
-def all_win_lines() -> List[List[Coord]]:
-    L: List[List[Coord]] = []
-    rng = range(4)
-    # 軸方向
-    for y in rng:
-        for z in rng:
-            L.append([(x, y, z) for x in rng])  # X軸
-    for x in rng:
-        for z in rng:
-            L.append([(x, y, z) for y in rng])  # Y軸
-    for x in rng:
-        for y in rng:
-            L.append([(x, y, z) for z in rng])  # Z軸
-    # 平面斜め
-    for z in rng:
-        L.append([(i, i, z) for i in rng])
-        L.append([(i, 3 - i, z) for i in rng])
-    for y in rng:
-        L.append([(i, y, i) for i in rng])
-        L.append([(i, y, 3 - i) for i in rng])
-    for x in rng:
-        L.append([(x, i, i) for i in rng])
-        L.append([(x, i, 3 - i) for i in rng])
-    # 空間対角
-    L.append([(i, i, i) for i in rng])
-    L.append([(i, i, 3 - i) for i in rng])
-    L.append([(i, 3 - i, i) for i in rng])
-    L.append([(3 - i, i, i) for i in rng])
-    return L
+    # 各軸方向
+    for z in range(SIZE):
+        for y in range(SIZE):
+            lines.append([(x, y, z) for x in range(SIZE)])            # x直線
+    for z in range(SIZE):
+        for x in range(SIZE):
+            lines.append([(x, y, z) for y in range(SIZE)])            # y直線
+    for y in range(SIZE):
+        for x in range(SIZE):
+            lines.append([(x, y, z) for z in range(SIZE)])            # z直線（縦）
 
-WIN_LINES = all_win_lines()
+    # 各面内の2D斜め
+    for z in range(SIZE):
+        lines.append([(i, i, z) for i in range(SIZE)])
+        lines.append([(i, SIZE-1-i, z) for i in range(SIZE)])
+    for y in range(SIZE):
+        lines.append([(i, y, i) for i in range(SIZE)])
+        lines.append([(i, y, SIZE-1-i) for i in range(SIZE)])
+    for x in range(SIZE):
+        lines.append([(x, i, i) for i in range(SIZE)])
+        lines.append([(x, i, SIZE-1-i) for i in range(SIZE)])
 
-def is_win_for(board: Board, player: int) -> bool:
-    for line in WIN_LINES:
-        ok = True
+    # 立体対角線（空間対角4本）
+    lines.append([(i, i, i) for i in range(SIZE)])
+    lines.append([(i, i, SIZE-1-i) for i in range(SIZE)])
+    lines.append([(i, SIZE-1-i, i) for i in range(SIZE)])
+    lines.append([(SIZE-1-i, i, i) for i in range(SIZE)])
+
+    return lines
+
+ALL_LINES = generate_lines()
+
+def is_winning_after(board: Board, player: int, x: int, y: int) -> bool:
+    z = place_inplace(board, x, y, player)
+    if z is None:
+        return False
+    win = check_win_at(board, player, (x, y, z))
+    undo_place(board, x, y, z)
+    return win
+
+def check_win_at(board: Board, player: int, last: Coord3) -> bool:
+    # last を含むラインだけ見てもよいが、4x4x4は軽いので全走査で充分
+    for line in ALL_LINES:
+        cnt = 0
         for (x, y, z) in line:
-            if board[z][y][x] != player:
-                ok = False
-                break
-        if ok:
+            if board[z][y][x] == player:
+                cnt += 1
+            else:
+                break if board[z][y][x] != player else None
+        # 上のbreakは使わず単純カウントにする
+    # もう一度正確に
+    for line in ALL_LINES:
+        if all(board[z][y][x] == player for (x, y, z) in line):
             return True
     return False
 
-# ============== 即勝ち / 多重スレッド（コピー盤で判定） ==============
-def immediate_winning_moves(board: Board, player: int) -> List[Tuple[int, int]]:
-    res: List[Tuple[int, int]] = []
-    for (x, y) in legal_cols(board):
-        b2 = clone(board)
-        if place_inplace(b2, x, y, player) is not None and is_win_for(b2, player):
-            res.append((x, y))
-    return res
+def count_immediate_wins(board: Board, player: int) -> int:
+    c = 0
+    for (x, y) in valid_xy_moves(board):
+        if is_winning_after(board, player, x, y):
+            c += 1
+    return c
 
-def k_threat_moves(board: Board, player: int, k: int) -> List[Tuple[int, int]]:
-    """ その手の後に『次手で勝てる手』がk個以上になる手（k=2:ダブル, k=3:トリプル） """
-    res: List[Tuple[int, int]] = []
-    for (x, y) in legal_cols(board):
-        b2 = clone(board)
-        if place_inplace(b2, x, y, player) is None:
-            continue
-        wins_next = immediate_winning_moves(b2, player)  # コピー盤
-        if len(wins_next) >= k:
-            res.append((x, y))
-    return res
+def is_floating_reach(board: Board, player: int, line: List[Coord3]) -> Optional[Coord3]:
+    # そのラインに相手石が無く、自分3石+空1なら空位置を返す
+    others = 3 if player == 1 else 1
+    cnt_p = cnt_o = 0
+    empty: Optional[Coord3] = None
+    for (x, y, z) in line:
+        v = board[z][y][x]
+        if v == player:
+            cnt_p += 1
+        elif v == others:
+            cnt_o += 1
+        else:
+            empty = (x, y, z)
+    if cnt_o == 0 and cnt_p == 3 and empty is not None:
+        # 空きマスが実際に打てる（重力OK）かも確認
+        x, y, z = empty
+        ze = lowest_empty_z(board, x, y)
+        if ze is not None and ze == z:
+            return empty
+    return None
 
-# ============== 形（フ型 / 逆ミッキー）検出：2D占有カラムで軽量判定 ==============
-# 盤は 0..3 の 4x4。形は「(x,y)のセット」で定義。回転(90°刻み)・反転を全生成して検出。
-Corner = [(0,0),(0,3),(3,0),(3,3)]
+def eval_board(board: Board, me: int, ply: int) -> int:
+    you = 3 - me
 
-# ※以下のベース形は“例”です。手元のノート定義に合わせて自由に編集してください。
-#   ここでは 4x4 に収まる代表的な5点形として用意し、回転・反転を自動展開します。
-F_SHAPES_BASE = [
-    {(0,0),(1,0),(2,0),(0,1),(0,2)},  # 横棒+縦棒の“F”っぽい
-]
-REV_MICKEY_BASE = [
-    {(0,0),(3,0),(1,1),(2,1),(1,2)},  # “耳耳+顔”を意識した逆ミッキー例
-]
-
-def rotate90(pt: Tuple[int,int]) -> Tuple[int,int]:
-    x,y = pt
-    return (3 - y, x)
-
-def reflect_x(pt: Tuple[int,int]) -> Tuple[int,int]:
-    x,y = pt
-    return (3 - x, y)
-
-def reflect_y(pt: Tuple[int,int]) -> Tuple[int,int]:
-    x,y = pt
-    return (x, 3 - y)
-
-def all_transforms(shape: set) -> List[set]:
-    variants = []
-    cur = set(shape)
-    for _ in range(4):
-        variants.append(cur)
-        variants.append(set(reflect_x(p) for p in cur))
-        variants.append(set(reflect_y(p) for p in cur))
-        # 次の回転
-        cur = set(rotate90(p) for p in cur)
-    # unique
-    uniq = []
-    seen = set()
-    for s in variants:
-        key = tuple(sorted(s))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(s)
-    return uniq
-
-F_SHAPES = [v for base in F_SHAPES_BASE for v in all_transforms(base)]
-REV_MICKEY_SHAPES = [v for base in REV_MICKEY_BASE for v in all_transforms(base)]
-
-def occupied_xy_by(board: Board, player: int) -> set:
-    """ そのプレイヤーが1つでも石を入れている (x,y) カラム集合 """
-    occ = set()
-    for x in range(4):
-        for y in range(4):
-            for z in range(4):
-                if board[z][y][x] == player:
-                    occ.add((x,y))
-                    break
-    return occ
-
-def shape_score_after_move(board: Board, x: int, y: int, player: int) -> int:
-    """ 形ボーナスの軽量評価（一致した形の個数で加点）"""
-    b2 = clone(board)
-    if place_inplace(b2, x, y, player) is None:
-        return -10**9  # 置けない
-    occ = occupied_xy_by(b2, player)
+    # 即勝利/敗北
+    if any(all(board[z][y][x] == me  for (x,y,z) in line) for line in ALL_LINES):
+        return WIN_SCORE - ply
+    if any(all(board[z][y][x] == you for (x,y,z) in line) for line in ALL_LINES):
+        return -WIN_SCORE + ply
 
     score = 0
-    # 一致完全包含で判定（必要なら“部分的一致で加点”に緩和可能）
-    for s in F_SHAPES:
-        if s.issubset(occ):
-            score += 3   # フ型は中加点
-    for s in REV_MICKEY_SHAPES:
-        if s.issubset(occ):
-            score += 4   # 逆ミッキーはやや高めに
-    # 角・中央近傍のちょい足し（タイブレーク用の弱い嗜好）
-    if (x,y) in Corner:
-        score += 1
-    if (x,y) in [(1,1),(1,2),(2,1),(2,2)]:
-        score += 1
+
+    # 1) パターン認識（相手混入ラインは無効）
+    #    自分ライン: 1,10,100,1000 / 相手ラインは対称に減点
+    table = [0, 1, 10, 120]   # 3連は大きめ（t点でさらに上乗せ）
+    for line in ALL_LINES:
+        cnt_me = cnt_you = 0
+        empties: List[Coord3] = []
+        for (x,y,z) in line:
+            v = board[z][y][x]
+            if v == me:
+                cnt_me += 1
+            elif v == you:
+                cnt_you += 1
+            else:
+                empties.append((x,y,z))
+        if cnt_you == 0:
+            score += table[cnt_me]
+            # t点ボーナス
+            if cnt_me == 3:
+                # 空が合法で z==3 ならボーナス
+                e = empties[0]
+                x, y, z = e
+                ze = lowest_empty_z(board, x, y)
+                if ze is not None and ze == z and z == 3:
+                    score += TPOINT_BONUS
+        if cnt_me == 0:
+            score -= table[cnt_you]
+            if cnt_you == 3:
+                e = [p for p in line if board[p[2]][p[1]][p[0]] == 0][0]
+                x, y, z = e
+                ze = lowest_empty_z(board, x, y)
+                if ze is not None and ze == z and z == 3:
+                    score -= TPOINT_BONUS
+
+    # 2) 位置ボーナス（中心優先）
+    #    (1,1) 最中央を+、その近傍もやや加点
+    for y in range(SIZE):
+        for x in range(SIZE):
+            ztop = SIZE-1
+            # スタックの一番上が空なら列の重心に対して軽く加点
+            if board[ztop][y][x] == 0:
+                cx = abs(1.5 - x)
+                cy = abs(1.5 - y)
+                score += int(CENTER_BONUS * (1.5 - (cx+cy)/2))
+
     return score
 
-# ============== 角・対角ユーティリティ ==============
-def my_corners(board: Board, me: int) -> List[Tuple[int,int]]:
-    res = []
-    for (x,y) in Corner:
-        # カラム内のどこかに自石があれば「その角を持っている」とみなす
-        for z in range(4):
-            if board[z][y][x] == me:
-                res.append((x,y))
+def order_moves(board: Board, me: int, moves: List[Coord2]) -> List[Coord2]:
+    # 1) 即勝ち
+    wins = []
+    blocks = []
+    double_threats = []
+    rest = []
+    you = 3 - me
+    for (x,y) in moves:
+        if is_winning_after(board, me, x, y):
+            wins.append((x,y))
+            continue
+        # 相手の即勝ちをブロック
+        z = place_inplace(board, x, y, me)
+        can_block = any(is_winning_after(board, you, bx, by) for (bx,by) in valid_xy_moves(board))
+        # ↑このままだと「相手が勝てる手があるか」判定。厳密ブロック判定は重いので簡略化。
+        # ダブルリーチ生成判定
+        my_immediate = count_immediate_wins(board, me)
+        if z is not None:
+            undo_place(board, x, y, z)
+        if my_immediate >= 2:
+            double_threats.append((x,y))
+        elif can_block:
+            blocks.append((x,y))
+        else:
+            rest.append((x,y))
+
+    # 適当にまとめる（探索前の並べ替え）
+    return wins + double_threats + blocks + rest
+
+def minimax(board: Board, depth: int, alpha: int, beta: int, me: int, turn: int, ply: int) -> int:
+    # me: ルート側プレイヤ
+    # turn: 手番プレイヤ
+    moves = valid_xy_moves(board)
+    you = 3 - turn
+
+    # 直前で勝敗決する可能性があるため毎ノードで簡易終局判定
+    # （より正確には last_move 起点のラインチェックで軽量化できる）
+    if depth == 0 or not moves:
+        return eval_board(board, me, ply)
+
+    # 即勝ち手があれば刈り取り
+    for (x,y) in moves:
+        if is_winning_after(board, turn, x, y):
+            return WIN_SCORE - ply if turn == me else -WIN_SCORE + ply
+
+    # move ordering
+    moves = order_moves(board, turn, moves)
+
+    if turn == me:
+        best = -10**9
+        for (x,y) in moves:
+            z = place_inplace(board, x, y, turn)
+            val = minimax(board, depth-1, alpha, beta, me, 3-turn, ply+1)
+            undo_place(board, x, y, z)
+            if val > best:
+                best = val
+            if best > alpha:
+                alpha = best
+            if alpha >= beta:
                 break
-    return res
-
-def opp_corners(board: Board, opp: int) -> List[Tuple[int,int]]:
-    res = []
-    for (x,y) in Corner:
-        for z in range(4):
-            if board[z][y][x] == opp:
-                res.append((x,y))
+        return best
+    else:
+        best = 10**9
+        for (x,y) in moves:
+            z = place_inplace(board, x, y, turn)
+            val = minimax(board, depth-1, alpha, beta, me, 3-turn, ply+1)
+            undo_place(board, x, y, z)
+            if val < best:
+                best = val
+            if best < beta:
+                beta = best
+            if alpha >= beta:
                 break
-    return res
+        return best
 
-def opposite_corner(x: int, y: int) -> Tuple[int,int]:
-    return (3 - x, 3 - y)
+def choose_best(board: Board, me: int, depth: int) -> Coord2:
+    # 1) まず即勝ち
+    for (x,y) in valid_xy_moves(board):
+        if is_winning_after(board, me, x, y):
+            return (x,y)
 
-# ============== メインAI（軽量ヒューリスティック優先） ==============
+    # 2) 相手の即勝ちブロック
+    you = 3 - me
+    for (x,y) in valid_xy_moves(board):
+        if is_winning_after(board, you, x, y):
+            return (x,y)
+
+    # 3) ダブルリーチ作成手を優先
+    cand = []
+    for (x,y) in valid_xy_moves(board):
+        z = place_inplace(board, x, y, me)
+        k = count_immediate_wins(board, me)
+        undo_place(board, x, y, z)
+        if k >= 2:
+            cand.append((x,y))
+    if cand:
+        return cand[0]
+
+    # 4) 通常探索（ミニマックス+αβ）
+    best_val = -10**9
+    best_move = None
+    moves = order_moves(board, me, valid_xy_moves(board))
+    for (x,y) in moves:
+        z = place_inplace(board, x, y, me)
+        val = minimax(board, depth-1, -10**9, 10**9, me, 3-me, 1)
+        undo_place(board, x, y, z)
+        if val > best_val:
+            best_val = val
+            best_move = (x,y)
+
+    # 5) フォールバック：中心寄り
+    if best_move is None:
+        cx_order = sorted(valid_xy_moves(board), key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))
+        best_move = cx_order[0]
+    return best_move
+
 class MyAI(Alg3D):
-    def get_move(
-        self,
-        board: Board,                 # board[z][y][x]
-        player: int,                  # 1:先手, 2:後手
-        last_move: Tuple[int, int, int]
-    ) -> Tuple[int, int]:
-        me = player
-        opp = 1 if player == 2 else 2
-        mv = count_bits(board)
+    def __init__(self, depth: int = DEPTH_DEFAULT):
+        self.depth = depth
 
-        # ---------------- 1) 初手は必ず“角取り” ----------------
-        if mv == 0:
-            for (x,y) in Corner:
-                if column_has_space(board, x, y):
-                    return (x, y)
+    def get_move(self, board: Board, player: int, last_move: Coord3) -> Coord2:
+        # 定石: 初手は(1,1)を好む（中央寄り）※qweralの「定石」方針に倣う簡易版
+        if all(board[z][y][x] == 0 for z in range(SIZE) for y in range(SIZE) for x in range(SIZE)):
+            return (1, 1)
 
-        # 後手の初手も“角優先”
-        if mv == 1 and me == 2:
-            # 可能なら相手角の対角を優先、無理なら別角
-            taken = opp_corners(board, opp)
-            target_order = []
-            if taken:
-                # 相手が取った角の対角
-                ox, oy = opposite_corner(*taken[0])
-                target_order.append((ox, oy))
-            # 残りの角
-            for c in Corner:
-                if c not in target_order:
-                    target_order.append(c)
-            for (x,y) in target_order:
-                if column_has_space(board, x, y):
-                    return (x, y)
+        return choose_best(board, player, self.depth)
 
-        # ---------------- 2) 二手目（先手の2手目=全体手数2のとき）
-        # 相手が“対角線”を取っていなければ“対角角”を取る。取られていれば別の角。
-        if me == 1 and mv == 2:
-            myc = my_corners(board, me)
-            if myc:
-                my_first_corner = myc[0]
-                ox, oy = opposite_corner(*my_first_corner)
-                opp_took_oxoy = (ox,oy) in opp_corners(board, opp)
-                if (not opp_took_oxoy) and column_has_space(board, ox, oy):
-                    return (ox, oy)
-                # 別の角
-                for (x,y) in Corner:
-                    if (x,y) != my_first_corner and column_has_space(board, x, y):
-                        return (x, y)
-
-        # ---------------- 3) 自分の即勝ち ----------------
-        wins = immediate_winning_moves(board, me)
-        if wins:
-            return wins[0]
-
-        # ---------------- 4) 相手の即勝ちブロック ----------------
-        opp_wins = immediate_winning_moves(board, opp)
-        if opp_wins:
-            # 角 > 他 の軽い優先
-            opp_wins.sort(key=lambda xy: (xy not in Corner, ))
-            for (x,y) in opp_wins:
-                if column_has_space(board, x, y):
-                    return (x, y)
-
-        # ---------------- 5) ダブル / トリプルスレッド狙い ----------------
-        # まずトリプル > ダブルの順で探す（探索はコピー盤で軽い）
-        tris = k_threat_moves(board, me, 3)
-        if tris:
-            # 角・形スコアでタイブレーク
-            tris.sort(key=lambda xy: (-shape_score_after_move(board, xy[0], xy[1], me),
-                                      xy not in Corner))
-            return tris[0]
-
-        dubs = k_threat_moves(board, me, 2)
-        if dubs:
-            dubs.sort(key=lambda xy: (-shape_score_after_move(board, xy[0], xy[1], me),
-                                      xy not in Corner))
-            return dubs[0]
-
-        # ---------------- 6) 形（フ型 / 逆ミッキー）を積極的に ----------------
-        # すべての合法手を「形スコア」で評価し、最高を選択
-        legal = list(legal_cols(board))
-        if legal:
-            best = max(legal, key=lambda xy: shape_score_after_move(board, xy[0], xy[1], me))
-            return best
-
-        # ---------------- フォールバック（万一） ----------------
-        for (x,y) in Corner:
-            if column_has_space(board, x, y):
-                return (x, y)
-        for (x,y) in legal_cols(board):
-            return (x, y)
-        return (0, 0)
+# エントリ（本番環境が import する想定）
+AI = MyAI()
