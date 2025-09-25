@@ -1,12 +1,14 @@
 # main.py
-# 4x4x4 立体四目並べ AI（即ブロック > 自分案の危険排除 > 定石 > 軽量評価）
-# 要望対応:
-# - 先手でも「相手の即勝ちブロック」を最優先（定石より上）
-# - 自分の全候補を1手ずつ仮置きし、その直後に相手が open-3(合法な1空)＝リーチになる案は却下
-#   （ただし自分の即勝ちは例外で許可。全案却下になる場合は被害最小の案を採用）
-# - 盤面は z=0 が最下層。石は「下から」積む（lowest_empty_z は z=0→3 の順で検索）
+# 4x4x4 立体四目並べ AI（即負けブロック徹底 & 危険手却下 版）
+# 優先度:
+#  1) 自分の即勝ち
+#  2) 相手の即勝ちブロック（先手でも最優先 / after==0 を最重視）
+#  3) 初手/応手の定石（先手=角 / 後手=角なら対角，中央寄りなら中央）
+#  4) 危険手フィルタ（自手後に相手の即勝ち or リーチが出る案は却下）
+#  5) 軽量評価（先手=攻め, 後手=守り）
 #
-# 思考時間<=10秒: 全探索せず1手仮置き評価＋絞り込みのみ
+# 重力: z=0 が最下層。lowest_empty_z は z=0→3 の順で探索＝下から置く。
+
 from typing import List, Tuple, Optional
 from framework import Alg3D, Board
 
@@ -15,7 +17,7 @@ Coord3 = Tuple[int, int, int]   # (x, y, z)
 
 SIZE = 4
 
-# 軽量ヒューリスティクス重み
+# 評価重み
 WIN_SCORE        = 1_000_000
 W_DOUBLE_THREAT  = 6000
 W_MY_OPEN3       = 800
@@ -36,14 +38,13 @@ def clone(board: Board) -> Board:
     return [[row[:] for row in plane] for plane in board]
 
 def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
-    """重力: z=0(最下層)から z=3(最上層)へ。最初の空きを返す。"""
+    # 重力: 下(z=0)から上(z=3)へ詰める
     for z in range(SIZE):
         if board[z][y][x] == 0:
             return z
     return None
 
 def valid_xy_moves(board: Board) -> List[Coord2]:
-    """上面(z=3)が空の列を合法手として返す。"""
     ms: List[Coord2] = []
     top = SIZE - 1
     for y in range(SIZE):
@@ -65,7 +66,7 @@ def undo_place(board: Board, x: int, y: int, z: int) -> None:
 def stones_count(board: Board) -> int:
     return sum(1 for z in range(SIZE) for y in range(SIZE) for x in range(SIZE) if board[z][y][x] != 0)
 
-# --- 全勝ち筋（76本） ---
+# --- 勝ち筋（76本） ---
 def generate_lines() -> List[List[Coord3]]:
     lines: List[List[Coord3]] = []
     # x直線 / y直線 / z直線
@@ -78,7 +79,7 @@ def generate_lines() -> List[List[Coord3]]:
     for y in range(SIZE):
         for x in range(SIZE):
             lines.append([(x, y, z) for z in range(SIZE)])
-    # 各面内の斜め
+    # 各面の斜め
     for z in range(SIZE):
         lines.append([(i, i, z) for i in range(SIZE)])
         lines.append([(i, SIZE-1-i, z) for i in range(SIZE)])
@@ -149,44 +150,50 @@ def count_double_threat(board: Board, player: int) -> int:
     """即勝ち手の数（>=2でダブルリーチ扱い）。"""
     return len(immediate_winning_squares(board, player))
 
-# ---------------- 定石（初手/応手 & 層・位置優先） ----------------
-def is_centerish(x: int, y: int) -> bool:
-    return (x, y) in CENTERS_2D
-
+# ---------------- 定石（初手/応手） ----------------
 def opening_first_move(board: Board, player: int) -> Optional[Coord2]:
-    """初手定石: 先手=角/ 後手=角には対角/ 中央寄りには中央取得。"""
     n = stones_count(board)
     if n == 0 and player == 1:
         for (x,y) in [(0,0),(3,3),(0,3),(3,0)]:
             if lowest_empty_z(board, x, y) is not None:
                 return (x, y)
     if n == 1 and player == 2:
-        # 相手の最初の石の (x,y) を探す（zは問わない）
+        # 先手(=1)の最初の石の (x,y) を検出（zは問わない）
+        opx = opy = None
         for y in range(SIZE):
             for x in range(SIZE):
                 for z in range(SIZE):
-                    if board[z][y][x] == 1:  # 先手=1
+                    if board[z][y][x] == 1:
                         opx, opy = x, y
-                        if (opx, opy) in CORNERS_2D:
-                            dx, dy = (3-opx, 3-opy)
-                            if lowest_empty_z(board, dx, dy) is not None:
-                                return (dx, dy)
-                        if is_centerish(opx, opy):
-                            for (cx, cy) in [(1,1),(2,1),(1,2),(2,2)]:
-                                if lowest_empty_z(board, cx, cy) is not None:
-                                    return (cx, cy)
-                        # それ以外→中央 > 角 > 辺
-                        for (cx, cy) in [(1,1),(2,1),(1,2),(2,2)]:
-                            if lowest_empty_z(board, cx, cy) is not None:
-                                return (cx, cy)
-                        for (x2,y2) in [(0,0),(3,3),(0,3),(3,0)]:
-                            if lowest_empty_z(board, x2, y2) is not None:
-                                return (x2, y2)
-                        for (x2,y2) in EDGES_2D:
-                            if lowest_empty_z(board, x2, y2) is not None:
-                                return (x2, y2)
+                        break
+                if opx is not None:
+                    break
+            if opx is not None:
+                break
+        if opx is not None:
+            # 角なら対角
+            if (opx, opy) in CORNERS_2D:
+                dx, dy = (3-opx, 3-opy)
+                if lowest_empty_z(board, dx, dy) is not None:
+                    return (dx, dy)
+            # 中央寄りなら中央4マスから取得
+            if (opx, opy) in CENTERS_2D:
+                for (cx, cy) in [(1,1),(2,1),(1,2),(2,2)]:
+                    if lowest_empty_z(board, cx, cy) is not None:
+                        return (cx, cy)
+            # それ以外: 中央 > 角 > 辺
+            for (cx, cy) in [(1,1),(2,1),(1,2),(2,2)]:
+                if lowest_empty_z(board, cx, cy) is not None:
+                    return (cx, cy)
+            for (x2,y2) in [(0,0),(3,3),(0,3),(3,0)]:
+                if lowest_empty_z(board, x2, y2) is not None:
+                    return (x2, y2)
+            for (x2,y2) in EDGES_2D:
+                if lowest_empty_z(board, x2, y2) is not None:
+                    return (x2, y2)
     return None
 
+# ---------------- 層/位置ボーナス ----------------
 def layer_position_bonus(board: Board, x: int, y: int, z: int) -> int:
     sc = 0
     if z in (1,2) and (x, y) in CENTERS_2D:
@@ -198,7 +205,22 @@ def layer_position_bonus(board: Board, x: int, y: int, z: int) -> int:
     sc += int(W_CENTER_2D * (1.5 - (cx + cy) / 2))
     return sc
 
-# ---------------- 1手仮置き評価（攻め/守り配合） ----------------
+# ---------------- 危険判定（自手後） ----------------
+def opponent_immediate_wins_after(board: Board, me: int, x: int, y: int) -> int:
+    you = 3 - me
+    z = place_inplace(board, x, y, me)
+    cnt = len(immediate_winning_squares(board, you))
+    undo_place(board, x, y, z)
+    return cnt
+
+def opponent_open3_after(board: Board, me: int, x: int, y: int) -> int:
+    you = 3 - me
+    z = place_inplace(board, x, y, me)
+    _, o3 = count_open2_open3(board, you)
+    undo_place(board, x, y, z)
+    return o3
+
+# ---------------- 軽量評価（先攻=攻め / 後攻=守り） ----------------
 def move_score(board: Board, me: int, x: int, y: int) -> int:
     you = 3 - me
     if is_winning_after(board, me, x, y):
@@ -236,19 +258,13 @@ def move_score(board: Board, me: int, x: int, y: int) -> int:
         )
     return score
 
-# ---------------- 危険手フィルタ ----------------
-def causes_opponent_open3_after(board: Board, me: int, x: int, y: int) -> bool:
-    """自分が(x,y)に置いた直後、相手に open-3 が1つ以上生じるか？（生じれば危険案）"""
-    you = 3 - me
-    z = place_inplace(board, x, y, me)
-    _, opp_o3 = count_open2_open3(board, you)
-    undo_place(board, x, y, z)
-    return opp_o3 > 0
-
-# ---------------- ルート選択（優先度の順序を修正） ----------------
+# ---------------- ルート選択 ----------------
 def choose_best(board: Board, me: int) -> Coord2:
-    you = 3 - me
     moves = valid_xy_moves(board)
+    if not moves:
+        return (0, 0)  # 盤面が満杯の保険
+
+    you = 3 - me
 
     # 1) 自分の即勝ち
     for (x, y) in moves:
@@ -258,7 +274,6 @@ def choose_best(board: Board, me: int) -> Coord2:
     # 2) 相手の即勝ちブロック（先手でも最優先）
     opp_now = immediate_winning_squares(board, you)
     if opp_now:
-        # after(相手即勝ち数) を最小化。タイなら自分評価が高い手。
         best_move = None
         best_after = 10**9
         best_score = -10**9
@@ -267,34 +282,51 @@ def choose_best(board: Board, me: int) -> Coord2:
             after = len(immediate_winning_squares(board, you))
             sc = move_score(board, me, x, y)
             undo_place(board, x, y, z)
+            # 最優先: after==0（相手の即勝ちを全消し）
             if after < best_after or (after == best_after and sc > best_score):
                 best_after, best_score = after, sc
                 best_move = (x, y)
                 if after == 0:
                     return best_move
-        if best_move is not None:
-            return best_move
+        # どうしても0にできない場合は最小 after を選ぶ
+        return best_move if best_move is not None else moves[0]
 
-    # 3) 初手/応手の定石（ブロックよりは下）
+    # 3) 初手/応手の定石（ただし危険手は使わない）
     mv = opening_first_move(board, me)
-    # ただし定石でも危険手は禁止（自分即勝ちの例外を除く）
     if mv is not None:
         x, y = mv
-        if is_winning_after(board, me, x, y) or not causes_opponent_open3_after(board, me, x, y):
+        if is_winning_after(board, me, x, y):
             return mv
-        # 定石が危険なら次善へフォールバック（↓通常選択へ）
+        if opponent_immediate_wins_after(board, me, x, y) == 0 and opponent_open3_after(board, me, x, y) == 0:
+            return mv
+        # 定石が危険ならスキップして通常選択へ
 
-    # 4) 危険手フィルタ：相手open-3を生む案は原則却下
+    # 4) 危険手フィルタ
     safe_moves: List[Coord2] = []
     for (x, y) in moves:
-        if is_winning_after(board, me, x, y):
-            return (x, y)  # 念のため
-        if not causes_opponent_open3_after(board, me, x, y):
-            safe_moves.append((x, y))
+        # 自分即勝ちはすでに捕捉済みなのでここでは純粋に危険判定
+        if opponent_immediate_wins_after(board, me, x, y) > 0:
+            continue  # “打ったら即負け”になる案は却下
+        if opponent_open3_after(board, me, x, y) > 0:
+            continue  # リーチを与える案も原則却下
+        safe_moves.append((x, y))
 
-    target_moves = safe_moves if safe_moves else moves  # 全滅なら被害最小方針へ
+    target_moves = safe_moves
+    if not target_moves:
+        # 全滅なら被害最小の案（即負け発生数 → open-3発生数 → 自分評価）
+        best = moves[0]
+        best_key = (10**9, 10**9, -10**9)  # (opp_immediate, opp_open3, -self_score) を最小化
+        for (x, y) in moves:
+            oi = opponent_immediate_wins_after(board, me, x, y)
+            o3 = opponent_open3_after(board, me, x, y)
+            sc = move_score(board, me, x, y)
+            key = (oi, o3, -sc)
+            if key < best_key:
+                best_key = key
+                best = (x, y)
+        return best
 
-    # 5) 軽量スコアでベスト
+    # 5) 軽量評価でベスト
     best = target_moves[0]
     best_sc = -10**9
     for (x, y) in target_moves:
