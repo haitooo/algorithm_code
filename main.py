@@ -14,6 +14,14 @@ def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
             return z
     return None
 
+def immediate_winning_squares_try(board: Board, player: int) -> List[Coord2]:
+    """合法手を総当たりして、置いた瞬間に勝ちになる(x,y)を厳密に列挙。"""
+    res: List[Coord2] = []
+    for (x, y) in valid_xy_moves(board):
+        if is_winning_after(board, player, x, y):
+            res.append((x, y))
+    return res
+
 def _center_sorted(moves: List[Coord2]) -> List[Coord2]:
     return sorted(moves, key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
 
@@ -199,14 +207,14 @@ def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Co
     you = 3 - me
     x, y = mv
     z = place_inplace(board, x, y, me)
-    # 念のため None ガード
     if z is None:
         return (0, 0, 0)
 
     before = len(opp_wins_now)
-    after  = len(line_immediate_winning_moves(board, you))
+    after  = len(immediate_winning_squares_try(board, you))
     blocked = max(0, before - after)
-    my_next = len(line_immediate_winning_moves(board, me))
+
+    my_next = len(immediate_winning_squares_try(board, me))
     tie_sv  = sideview_pattern_score_after_move(board, me, x, y) if (x, y) in EDGES else 0
 
     undo_place(board, x, y, z)
@@ -219,17 +227,16 @@ def choose_best(board: Board, me: int) -> Coord2:
         return (0, 0)
     you = 3 - me
 
-    # 1) 自分の即勝ち
-    my_wins_now = line_immediate_winning_moves(board, me)
+    # 1) 自分の即勝ち（総当たり版で厳密検出）
+    my_wins_now = immediate_winning_squares_try(board, me)
     if my_wins_now:
-        # 合法手に限定して返す
         for mv in moves:
             if mv in my_wins_now:
                 return mv
         return _center_sorted(my_wins_now)[0]  # 念のため
 
     # 2) 相手の即勝ちブロック（ダイレクト最優先＋堅牢フォールバック）
-    opp_wins_now = line_immediate_winning_moves(board, you)
+    opp_wins_now = immediate_winning_squares_try(board, you)
     if opp_wins_now:
         # 2-1) ダイレクトブロック（合法手∩相手勝ちマス）
         direct = [mv for mv in opp_wins_now if mv in moves]
@@ -241,21 +248,19 @@ def choose_best(board: Board, me: int) -> Coord2:
         # 2-2) ダイレクト不可 → after==0 を最優先、無理なら after 最小化
         best = None
         best_after = 10**9
-        for (x, y) in _center_sorted(moves):     # 中央寄りから試す
+        for (x, y) in _center_sorted(moves):
             z = place_inplace(board, x, y, me)
             if z is None:
                 continue
-            after = len(line_immediate_winning_moves(board, you))
+            after = len(immediate_winning_squares_try(board, you))
             undo_place(board, x, y, z)
             if after == 0:
                 return (x, y)
             if after < best_after:
                 best_after = after
                 best = (x, y)
-        # どれも after>0 でも、中央寄りの中で最小化できた手を返す
         if best is not None:
             return best
-        # 理論上ここには来ないが保険
         return _center_sorted(moves)[0]
 
     # 2.4) 逆ミッキー“完成”→サイド直行
