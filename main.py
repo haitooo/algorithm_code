@@ -14,6 +14,9 @@ def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
             return z
     return None
 
+def _center_sorted(moves: List[Coord2]) -> List[Coord2]:
+    return sorted(moves, key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
+
 def valid_xy_moves(board: Board) -> List[Coord2]:
     res: List[Coord2] = []
     top = SIZE - 1
@@ -193,20 +196,16 @@ def find_reverse_mickey_side_move(board: Board, me: int) -> Optional[Coord2]:
     return best_mv
 
 def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Coord2]) -> Tuple[int,int,int]:
-    """
-    ダイレクトブロック候補 mv の優先度スコア:
-      - blocked: この一手で消せる相手の即勝ち手の数（大きいほど良い）
-      - my_next: 置いた直後の自分の即勝ち手の本数（大きいほど良い）
-      - tie_sv : 側面ターゲット形スコア（辺では形が良いほど優先）
-    """
     you = 3 - me
     x, y = mv
     z = place_inplace(board, x, y, me)
+    # 念のため None ガード
+    if z is None:
+        return (0, 0, 0)
 
     before = len(opp_wins_now)
     after  = len(line_immediate_winning_moves(board, you))
     blocked = max(0, before - after)
-
     my_next = len(line_immediate_winning_moves(board, me))
     tie_sv  = sideview_pattern_score_after_move(board, me, x, y) if (x, y) in EDGES else 0
 
@@ -223,27 +222,29 @@ def choose_best(board: Board, me: int) -> Coord2:
     # 1) 自分の即勝ち
     my_wins_now = line_immediate_winning_moves(board, me)
     if my_wins_now:
+        # 合法手に限定して返す
         for mv in moves:
             if mv in my_wins_now:
                 return mv
-        return my_wins_now[0]
+        return _center_sorted(my_wins_now)[0]  # 念のため
 
-    # 2) 相手の即勝ちブロック（ダイレクト最優先）
+    # 2) 相手の即勝ちブロック（ダイレクト最優先＋堅牢フォールバック）
     opp_wins_now = line_immediate_winning_moves(board, you)
     if opp_wins_now:
-        # 2-1) ダイレクトブロック（合法手∩相手の勝ちマス）
-        direct = [mv for mv in moves if mv in opp_wins_now]
+        # 2-1) ダイレクトブロック（合法手∩相手勝ちマス）
+        direct = [mv for mv in opp_wins_now if mv in moves]
         if direct:
-            # ブロック数 → 自分の次手即勝ち本数 → 側面ターゲット形スコア で降順ソート
             scored = [(_score_direct_block(board, me, mv, opp_wins_now), mv) for mv in direct]
             scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2]), reverse=True)
             return scored[0][1]
 
-        # 2-2) ダイレクトに塞げない場合のみ、after==0 を最優先、だめなら after を最小化
+        # 2-2) ダイレクト不可 → after==0 を最優先、無理なら after 最小化
         best = None
         best_after = 10**9
-        for (x, y) in moves:
+        for (x, y) in _center_sorted(moves):     # 中央寄りから試す
             z = place_inplace(board, x, y, me)
+            if z is None:
+                continue
             after = len(line_immediate_winning_moves(board, you))
             undo_place(board, x, y, z)
             if after == 0:
@@ -251,19 +252,25 @@ def choose_best(board: Board, me: int) -> Coord2:
             if after < best_after:
                 best_after = after
                 best = (x, y)
-        return best if best is not None else moves[0]
+        # どれも after>0 でも、中央寄りの中で最小化できた手を返す
+        if best is not None:
+            return best
+        # 理論上ここには来ないが保険
+        return _center_sorted(moves)[0]
 
     # 2.4) 逆ミッキー“完成”→サイド直行
     mv_rm = find_reverse_mickey_side_move(board, me)
     if mv_rm is not None:
         return mv_rm
 
-    # 2.5) 逆ミッキー“作成”狙い（ダブルスレット）
+    # 2.5) 逆ミッキー“作成”狙い（DT）
     best_rm_move: Optional[Coord2] = None
     best_dt = 0
     best_tie = -1
     for (x, y) in moves:
         z = place_inplace(board, x, y, me)
+        if z is None:
+            continue
         my_next = len(line_immediate_winning_moves(board, me))
         opp_next = len(line_immediate_winning_moves(board, you))
         tie = sideview_pattern_score_after_move(board, me, x, y) if (x, y) in EDGES else 0
