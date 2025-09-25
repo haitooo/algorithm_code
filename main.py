@@ -1,5 +1,5 @@
 # main.py
-# 4x4x4 立体四目並べ AI（全76ライン精査＋“側面ターゲット形”＋逆ミッキー優先）
+# 4x4x4 立体四目並べ AI（全76ライン精査＋“側面ターゲット形”＋逆ミッキー完成→サイド直行）
 from typing import List, Tuple, Optional, Dict, Set
 from framework import Alg3D, Board
 
@@ -120,14 +120,16 @@ def column_has_my_stone(board: Board, me: int, x: int, y: int) -> bool:
             return True
     return False
 
-# ---------- 側面ターゲット形のスコア ----------
+# ---------- 側面ターゲット形（参考スコア） ----------
 def sideview_required_cells_for_row(y_fixed: int) -> List[Coord3]:
-    # 横（y固定）: 必須6マス
-    return [(0, y_fixed, 0), (3, y_fixed, 0), (1, y_fixed, 1), (2, y_fixed, 1), (1, y_fixed, 2), (2, y_fixed, 2)]
+    return [(0, y_fixed, 0), (3, y_fixed, 0),
+            (1, y_fixed, 1), (2, y_fixed, 1),
+            (1, y_fixed, 2), (2, y_fixed, 2)]
 
 def sideview_required_cells_for_col(x_fixed: int) -> List[Coord3]:
-    # 横（x固定）: 必須6マス
-    return [(x_fixed, 0, 0), (x_fixed, 3, 0), (x_fixed, 1, 1), (x_fixed, 2, 1), (x_fixed, 1, 2), (x_fixed, 2, 2)]
+    return [(x_fixed, 0, 0), (x_fixed, 3, 0),
+            (x_fixed, 1, 1), (x_fixed, 2, 1),
+            (x_fixed, 1, 2), (x_fixed, 2, 2)]
 
 def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> int:
     you = 3 - me
@@ -140,6 +142,55 @@ def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> 
     score = 0 if opp_block else sum(1 for (xx, yy, zz) in req if board[zz][yy][xx] == me)
     undo_place(board, x, y, z)
     return score
+
+# ---------- 逆ミッキー“完成”検出 → サイド直行 ----------
+def is_reverse_mickey_row_complete(board: Board, me: int, y: int) -> bool:
+    for (x,y0,z) in sideview_required_cells_for_row(y):
+        if board[z][y0][x] != me:
+            return False
+    return True
+
+def is_reverse_mickey_col_complete(board: Board, me: int, x: int) -> bool:
+    for (x0,y,z) in sideview_required_cells_for_col(x):
+        if board[z][y][x0] != me:
+            return False
+    return True
+
+def find_reverse_mickey_side_move(board: Board, me: int) -> Optional[Coord2]:
+    """逆ミッキー型が“完成”していたら、そのサイド(左右/上下)で置ける方を返す。複数なら DT本数が多い方。"""
+    you = 3 - me
+    candidates: List[Coord2] = []
+
+    # 行ビュー（y固定）：左右サイド (0,y) / (3,y)
+    for y in range(SIZE):
+        if is_reverse_mickey_row_complete(board, me, y):
+            for sx in (0, 3):
+                z = lowest_empty_z(board, sx, y)
+                if z in (1, 2):  # 中層に合法的に置ける
+                    candidates.append((sx, y))
+
+    # 列ビュー（x固定）：上下サイド (x,0) / (x,3)
+    for x in range(SIZE):
+        if is_reverse_mickey_col_complete(board, me, x):
+            for sy in (0, 3):
+                z = lowest_empty_z(board, x, sy)
+                if z in (1, 2):
+                    candidates.append((x, sy))
+
+    if not candidates:
+        return None
+
+    # 候補が複数なら「置いた直後の“自分の即勝ち手”本数（DT）」が多い方を採用
+    best_mv = candidates[0]
+    best_dt = -1
+    for (x, y) in candidates:
+        z = place_inplace(board, x, y, me)
+        my_dt = len(line_immediate_winning_moves(board, me))
+        undo_place(board, x, y, z)
+        if my_dt > best_dt:
+            best_dt = my_dt
+            best_mv = (x, y)
+    return best_mv
 
 # ---------- ルール実装（choose_best） ----------
 def choose_best(board: Board, me: int) -> Coord2:
@@ -170,8 +221,12 @@ def choose_best(board: Board, me: int) -> Coord2:
                 best_after = after; best = (x, y)
         return best if best is not None else moves[0]
 
-    # 2.5) 逆ミッキー型（ダブルスレット作成）最優先
-    #  置いた直後に「自分の即勝ち手」が2本以上 & 相手の即勝ちが0 なら採用。
+    # 2.4) 逆ミッキー“完成”→サイド直行（高優先度）
+    mv_rm = find_reverse_mickey_side_move(board, me)
+    if mv_rm is not None:
+        return mv_rm
+
+    # 2.5) 逆ミッキー“作成”狙い（ダブルスレット作成）
     best_rm_move: Optional[Coord2] = None
     best_dt = 0
     best_tie = -1
@@ -179,7 +234,6 @@ def choose_best(board: Board, me: int) -> Coord2:
         z = place_inplace(board, x, y, me)
         my_next = len(line_immediate_winning_moves(board, me))
         opp_next = len(line_immediate_winning_moves(board, you))
-        # タイブレークに“側面ターゲット形スコア”を使用（特に辺で効く）
         tie = sideview_pattern_score_after_move(board, me, x, y) if (x, y) in EDGES else 0
         undo_place(board, x, y, z)
         if my_next >= 2 and opp_next == 0:
@@ -202,8 +256,7 @@ def choose_best(board: Board, me: int) -> Coord2:
             if z in (1, 2):
                 return (x, y)
 
-    # 5) 辺 {1,2,5,9,8,C,E,F}（2〜3層 かつ 行/列の角いずれかに自分石）→
-    #    “側面ターゲット形”の pattern_score を最大化して選ぶ
+    # 5) 辺 {1,2,5,9,8,C,E,F}（2〜3層 かつ 行/列の角いずれかに自分石）→側面ターゲット形を優先
     edge_cands: List[Coord2] = []
     for (x, y) in EDGES:
         if (x, y) in moves:
