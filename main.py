@@ -1,15 +1,26 @@
 # main.py
-# 4x4x4 立体四目並べ AI（堅牢ブロック＋“側面ターゲット形”＋逆ミッキー＆フ型フィニッシュ）
+# 4x4x4 立体四目並べ AI
+# 追加実装:
+# ① 自殺手フィルタ（相手DT>=2や t点支えを作る手の一括排除）
+# ② 軽量 Threat-Space Search（脅威集合に限定した深さ2 Negamax + αβ）
+# ③ t点パリティの明示的禁止（z==2 に置いて相手の z==3 即勝ちを開通させる手を抑止）
+#
+# 既存機能:
+# - 全76ライン精査
+# - 即勝ち/即負けブロック最優先
+# - “側面ターゲット形”・逆ミッキー検出とサイド直行
+# - 最終ガード（返却直前でもう一度ブロック必須か確認）
+
 from typing import List, Tuple, Optional, Dict, Set
 from framework import Alg3D, Board
 
-Coord2 = Tuple[int, int]
-Coord3 = Tuple[int, int, int]
+Coord2 = Tuple[int, int]        # (x, y)
+Coord3 = Tuple[int, int, int]   # (x, y, z)
 SIZE = 4
 
 # ---------- 基本ユーティリティ ----------
 def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
-    for z in range(SIZE):
+    for z in range(SIZE):              # 重力: z=0(最下)→上
         if board[z][y][x] == 0:
             return z
     return None
@@ -38,6 +49,7 @@ def undo_place(board: Board, x: int, y: int, z: int) -> None:
 # ---------- 勝ち筋（76本） ----------
 def generate_lines() -> List[List[Coord3]]:
     L: List[List[Coord3]] = []
+    # x直線 / y直線 / z直線
     for z in range(SIZE):
         for y in range(SIZE):
             L.append([(x, y, z) for x in range(SIZE)])
@@ -47,6 +59,7 @@ def generate_lines() -> List[List[Coord3]]:
     for y in range(SIZE):
         for x in range(SIZE):
             L.append([(x, y, z) for z in range(SIZE)])
+    # 各面の斜め
     for z in range(SIZE):
         L.append([(i, i, z) for i in range(SIZE)])
         L.append([(i, SIZE-1-i, z) for i in range(SIZE)])
@@ -56,6 +69,7 @@ def generate_lines() -> List[List[Coord3]]:
     for x in range(SIZE):
         L.append([(x, i, i) for i in range(SIZE)])
         L.append([(x, i, SIZE-1-i) for i in range(SIZE)])
+    # 空間対角
     L.append([(i, i, i) for i in range(SIZE)])
     L.append([(i, i, SIZE-1-i) for i in range(SIZE)])
     L.append([(i, SIZE-1-i, i) for i in range(SIZE)])
@@ -64,7 +78,7 @@ def generate_lines() -> List[List[Coord3]]:
 
 ALL_LINES = generate_lines()
 
-# “最後の一手”だけで勝ちを見るための索引
+# 各マスが属するライン（最後の一手だけを見るための索引）
 LINES_THROUGH: Dict[Coord3, List[int]] = {}
 for li, line in enumerate(ALL_LINES):
     for (x,y,z) in line:
@@ -72,6 +86,7 @@ for li, line in enumerate(ALL_LINES):
 
 # ---------- 即勝ち検出 ----------
 def line_immediate_winning_moves(board: Board, player: int) -> List[Coord2]:
+    """全76ライン走査での即勝ち候補（重力OKのみ）"""
     you = 3 - player
     wins: Set[Coord2] = set()
     for line in ALL_LINES:
@@ -90,6 +105,7 @@ def line_immediate_winning_moves(board: Board, player: int) -> List[Coord2]:
     return list(wins)
 
 def is_winning_after(board: Board, player: int, x: int, y: int) -> bool:
+    """最後に置いたマスを含むラインでのみ勝ち判定（誤検出防止）"""
     z = place_inplace(board, x, y, player)
     if z is None: return False
     win = False
@@ -101,21 +117,11 @@ def is_winning_after(board: Board, player: int, x: int, y: int) -> bool:
     return win
 
 def immediate_winning_squares_try(board: Board, player: int) -> List[Coord2]:
+    """合法手総当たりの即勝ち列挙（堅牢）"""
     res: List[Coord2] = []
     for (x, y) in valid_xy_moves(board):
         if is_winning_after(board, player, x, y):
             res.append((x, y))
-    return res
-
-# ==== NEW (Fu) ==== 即勝ち＋zを返すユーティリティ
-def immediate_wins_with_z(board: Board, player: int) -> List[Tuple[Coord2, int]]:
-    res: List[Tuple[Coord2, int]] = []
-    for (x, y) in valid_xy_moves(board):
-        z = lowest_empty_z(board, x, y)
-        if z is None: 
-            continue
-        if is_winning_after(board, player, x, y):
-            res.append(((x, y), z))
     return res
 
 # ---------- ラベル→座標 ----------
@@ -160,9 +166,11 @@ def sideview_required_cells_for_col(x_fixed: int) -> List[Coord3]:
             (x_fixed, 1, 2), (x_fixed, 2, 2)]
 
 def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> int:
+    """まだ置いていない前提で (x,y) に仮置きして評価"""
     you = 3 - me
     z = place_inplace(board, x, y, me)
-    if z is None: return 0
+    if z is None:
+        return 0
     if y in (0, 3): req = sideview_required_cells_for_row(y)
     else:           req = sideview_required_cells_for_col(x)
     opp_block = any(board[zz][yy][xx] == you for (xx, yy, zz) in req)
@@ -171,6 +179,7 @@ def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> 
     return score
 
 def sideview_pattern_score_on_board(board: Board, me: int, x: int, y: int) -> int:
+    """既に (x,y) に自石を仮置き“済み”の盤面を評価（追加の仮置きはしない）"""
     you = 3 - me
     if y in (0, 3): req = sideview_required_cells_for_row(y)
     else:           req = sideview_required_cells_for_col(x)
@@ -178,7 +187,7 @@ def sideview_pattern_score_on_board(board: Board, me: int, x: int, y: int) -> in
         return 0
     return sum(1 for (xx, yy, zz) in req if board[zz][yy][xx] == me)
 
-# ---------- 逆ミッキー完成 → サイド直行 ----------
+# ---------- 逆ミッキー“完成”検出 → サイド直行 ----------
 def is_reverse_mickey_row_complete(board: Board, me: int, y: int) -> bool:
     for (x,y0,z) in sideview_required_cells_for_row(y):
         if board[z][y0][x] != me: return False
@@ -207,76 +216,31 @@ def find_reverse_mickey_side_move(board: Board, me: int) -> Optional[Coord2]:
     best_mv = candidates[0]; best_dt = -1
     for (x, y) in candidates:
         z = place_inplace(board, x, y, me)
-        my_dt = len(immediate_winning_squares_try(board, me))
+        my_dt = len(immediate_winning_squares_try(board, me))  # 総当たり版で堅牢化
         undo_place(board, x, y, z)
         if my_dt > best_dt:
             best_dt = my_dt; best_mv = (x, y)
     return best_mv
 
-# ==== NEW (Fu) ==== サイド座標集合
-def _side_cells() -> List[Coord2]:
-    S: Set[Coord2] = set()
-    for x in range(4):
-        S.add((x,0)); S.add((x,3))
-    for y in range(4):
-        S.add((0,y)); S.add((3,y))
-    return list(S)
-
-# ==== NEW (Fu) ==== フ型“フィニッシュ”探索
-def find_fu_side_finish_move(board: Board, me: int) -> Optional[Coord2]:
-    """
-    サイドに置いた“その一手”で
-      - 自分の即勝ち手が2つ以上（DT>=2）
-      - そのDTの中に z==2 or z==3（3・4段目）で成立する勝ちが十分に含まれる
-    を満たす手を優先採用。
-    ※記事の「端の列の3,4段目にダブルリーチ」を近似的に実装
-    """
-    moves = valid_xy_moves(board)
-    side = [mv for mv in _side_cells() if mv in moves]
-    if not side:
-        return None
-
-    best_mv = None
-    best_key = (-1, -1, -10)  # (DT本数, z>=2のDT数, 形スコア)
-
-    for (x, y) in side:
-        # 危険手は弾く（t支えは別関数で後段チェックするが、ここでは軽く）
-        z = place_inplace(board, x, y, me)
-        if z is None:
-            continue
-
-        wins_z = immediate_wins_with_z(board, me)  # [( (wx,wy), wz ), ...]
-        dt_all = len(wins_z)
-        dt_high = sum(1 for ((wx,wy), wz) in wins_z if wz in (2,3))
-
-        # ※ “フ型的”なフィニッシュ：DT>=2 かつ 上層絡みがある
-        if dt_all >= 2 and dt_high >= 1:
-            # 形が良い（側面ターゲット形の点数）ほど優先
-            shape = sideview_pattern_score_on_board(board, me, x, y) if (x,y) in EDGES else 0
-            key = (dt_all, dt_high, shape)
-            if key > best_key:
-                best_key = key
-                best_mv = (x, y)
-
-        undo_place(board, x, y, z)
-
-    return best_mv
-
-# ---------- 自殺手 / t点パリティ ----------
+# ---------- ① 自殺手フィルタ ＋ ③ t点パリティ ----------
 def is_t_support_move(board: Board, me: int, x: int, y: int) -> bool:
+    """z==2 に自分が置くことで、その列の z==3 に相手の“即勝ち”を開通させる手を禁止。"""
     you = 3 - me
     z = lowest_empty_z(board, x, y)
-    if z != 2:
+    if z != 2:  # z==2 以外は t点支えにならない
         return False
     z2 = place_inplace(board, x, y, me)
     if z2 is None:
         return True
+    # 直後、相手が (x,y) に置ける（z==3）ようになり、それが即勝ちか？
     opens_tpoint_win = is_winning_after(board, you, x, y)
     undo_place(board, x, y, z2)
     return opens_tpoint_win
 
 def is_suicide_move(board: Board, me: int, x: int, y: int) -> bool:
+    """自分の即勝ちでないのに、相手の即勝ち本数を2以上にする手を禁止。"""
     you = 3 - me
+    # 自分の即勝ちなら許可
     if is_winning_after(board, me, x, y):
         return False
     z = place_inplace(board, x, y, me)
@@ -287,29 +251,37 @@ def is_suicide_move(board: Board, me: int, x: int, y: int) -> bool:
     return len(opp_now) >= 2
 
 def safe_filter_moves(board: Board, me: int, moves: List[Coord2]) -> List[Coord2]:
+    """自殺手/ t支え を除外。全滅したら元の moves を返す（合法手ゼロは避ける）。"""
     safe: List[Coord2] = []
     for (x, y) in moves:
-        if is_suicide_move(board, me, x, y):   continue
-        if is_t_support_move(board, me, x, y): continue
+        if is_suicide_move(board, me, x, y):
+            continue
+        if is_t_support_move(board, me, x, y):
+            continue
         safe.append((x, y))
     return safe if safe else moves
 
-# ---------- ダイレクトブロックの優先度 ----------
+# ---------- ダイレクトブロックのスコアリング ----------
 def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Coord2]) -> Tuple[int,int,int]:
+    """ダイレクトブロック候補の優先度: (ブロック数, 自分のDT, 側面形スコア)"""
     you = 3 - me
     x, y = mv
     z = place_inplace(board, x, y, me)
     if z is None: return (0, 0, 0)
+
     before = len(opp_wins_now)
     after  = len(immediate_winning_squares_try(board, you))
     blocked = max(0, before - after)
+
     my_next = len(immediate_winning_squares_try(board, me))
     tie_sv  = sideview_pattern_score_on_board(board, me, x, y) if (x, y) in EDGES else 0
+
     undo_place(board, x, y, z)
     return (blocked, my_next, tie_sv)
 
-# ---------- 最終ガード ----------
+# ---------- ブロック安全化の“最終ガード” ----------
 def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
+    """返す直前に再確認：相手の即勝ちがあるのに塞いでいなければ強制ブロック。"""
     you = 3 - me
     my_now = immediate_winning_squares_try(board, me)
     if my_now:
@@ -319,12 +291,14 @@ def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
         return chosen
     if chosen in opp_set:
         return chosen
+    # ダイレクトに塞げるなら差し替え
     moves = valid_xy_moves(board)
     direct = [mv for mv in moves if mv in opp_set]
     if direct:
         scored = [(_score_direct_block(board, me, mv, list(opp_set)), mv) for mv in direct]
         scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2]), reverse=True)
         return scored[0][1]
+    # ダイレクト不可 → after==0 を最優先、なければ after 最小化
     best = None; best_after = 10**9
     for (x, y) in _center_sorted(moves):
         z = place_inplace(board, x, y, me)
@@ -336,15 +310,19 @@ def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
             best_after = after; best = (x, y)
     return best if best is not None else (_center_sorted(moves)[0] if moves else (0,0))
 
-# ---------- 脅威限定の浅読み（お好みで残す） ----------
+# ---------- ② 軽量 Threat-Space Search（深さ2 Negamax + αβ） ----------
 THREAT_BEAM = 10
+
 def _tactical_eval(board: Board, me: int) -> int:
+    """タクティカル評価：即勝ち本数を主に。DTや側面形で微調整。"""
     you = 3 - me
     my_now  = len(immediate_winning_squares_try(board, me))
     opp_now = len(immediate_winning_squares_try(board, you))
     score = 10_000*(my_now - opp_now)
+    # DT強調
     if my_now >= 2:  score += 1_500
     if opp_now >= 2: score -= 2_000
+    # 盤面の“側面ターゲット形”の総和（軽く）
     sv_sum = 0
     for y in (0,3):
         for x in range(1,3):
@@ -358,28 +336,47 @@ def _tactical_eval(board: Board, me: int) -> int:
     return score
 
 def _tactical_candidates(board: Board, turn: int, me: int) -> List[Coord2]:
+    """脅威集合（即勝ち / ブロック / 中央2-3層 / 逆ミッキーサイド / 辺の良形）に絞る。"""
     moves = valid_xy_moves(board)
     if not moves: return []
     you = 3 - turn
+
     wins_turn = set(immediate_winning_squares_try(board, turn))
     wins_opp  = set(immediate_winning_squares_try(board, you))
+
     cands: Set[Coord2] = set()
-    cands |= wins_turn; cands |= wins_opp
+    cands |= wins_turn
+    cands |= wins_opp
+
+    # 逆ミッキー完成サイド（その手番基準）
     mv_rm = find_reverse_mickey_side_move(board, turn)
-    if mv_rm and mv_rm in moves: cands.add(mv_rm)
+    if mv_rm and mv_rm in moves:
+        cands.add(mv_rm)
+
+    # 中央4マスの2-3層
     for (x, y) in CENTERS:
         if (x, y) in moves:
             z = lowest_empty_z(board, x, y)
-            if z in (1,2): cands.add((x,y))
+            if z in (1,2):
+                cands.add((x,y))
+
+    # 辺の2-3層（軽く）
     for (x, y) in EDGES:
         if (x, y) in moves:
             z = lowest_empty_z(board, x, y)
-            if z in (1,2): cands.add((x,y))
+            if z in (1,2):
+                cands.add((x,y))
+
+    # 候補が少なければ中央寄りで補完
     if len(cands) < 4:
         for mv in _center_sorted(moves):
             cands.add(mv)
-            if len(cands) >= 6: break
+            if len(cands) >= 6:
+                break
+
+    # ヒューリスティクで順序付け & ビーム
     ordered = list(cands)
+    # 並べ替え：即勝ち＞ブロック＞側面形＞中心寄り
     def _score(mv: Coord2) -> Tuple[int,int,int,int]:
         x,y = mv
         s1 = 3 if mv in wins_turn else 0
@@ -391,35 +388,52 @@ def _tactical_candidates(board: Board, turn: int, me: int) -> List[Coord2]:
     return ordered[:THREAT_BEAM]
 
 def _negamax_threat(board: Board, depth: int, alpha: int, beta: int, turn: int, me: int) -> int:
+    """脅威集合に限定した軽量Negamax（先読み2〜3手）。"""
     if depth == 0:
         return _tactical_eval(board, me)
+
     moves = _tactical_candidates(board, turn, me)
     if not moves:
         return _tactical_eval(board, me)
+
     you = 3 - turn
-    if immediate_winning_squares_try(board, turn):
-        return 100_000 - (3 - depth)
+
+    # 即勝ちの早期終了
+    wins = immediate_winning_squares_try(board, turn)
+    if wins:
+        return 100_000 - (3 - depth)  # 深い方を高評価
+
     best = -10**9
     for (x, y) in moves:
         z = place_inplace(board, x, y, turn)
         if z is None:
             continue
+
+        # 自殺手は読み中では緩く扱うが、t支えだけは強く抑止（分岐削減）
         if is_t_support_move(board, turn, x, y):
             undo_place(board, x, y, z)
             continue
+
         score = -_negamax_threat(board, depth-1, -beta, -alpha, you, me)
         undo_place(board, x, y, z)
-        if score > best: best = score
-        if best > alpha: alpha = best
-        if alpha >= beta: break
+
+        if score > best:
+            best = score
+        if best > alpha:
+            alpha = best
+        if alpha >= beta:
+            break
     return best
 
 def threat_space_best_move(board: Board, me: int, max_depth: int = 2) -> Optional[Coord2]:
+    """脅威集合だけで浅読みして最良手を返す。"""
     moves = _tactical_candidates(board, me, me)
     if not moves:
         return None
+    # ルートでは自殺手/t支えを除外してから選定
     moves = safe_filter_moves(board, me, moves)
-    best_mv = moves[0]; best_sc = -10**9
+    best_mv = moves[0]
+    best_sc = -10**9
     you = 3 - me
     for (x, y) in moves:
         z = place_inplace(board, x, y, me)
@@ -428,16 +442,17 @@ def threat_space_best_move(board: Board, me: int, max_depth: int = 2) -> Optiona
         sc = -_negamax_threat(board, max_depth-1, -10**9, 10**9, you, me)
         undo_place(board, x, y, z)
         if sc > best_sc:
-            best_sc = sc; best_mv = (x, y)
+            best_sc = sc
+            best_mv = (x, y)
     return best_mv
 
-# ---------- 手選択 ----------
+# ---------- 手選択（優先順位ロジック） ----------
 def choose_best(board: Board, me: int) -> Coord2:
     moves = valid_xy_moves(board)
     if not moves: return (0, 0)
     you = 3 - me
 
-    # 1) 自分の即勝ち
+    # 1) 自分の即勝ち（厳密）
     my_wins_now = immediate_winning_squares_try(board, me)
     if my_wins_now:
         for mv in moves:
@@ -445,7 +460,7 @@ def choose_best(board: Board, me: int) -> Coord2:
                 return mv
         return _center_sorted(my_wins_now)[0]
 
-    # 2) 相手の即勝ちブロック
+    # 2) 相手の即勝ちブロック（ダイレクト最優先）
     opp_wins_now = list(set(immediate_winning_squares_try(board, you)) | set(line_immediate_winning_moves(board, you)))
     if opp_wins_now:
         direct = [mv for mv in opp_wins_now if mv in moves]
@@ -453,6 +468,7 @@ def choose_best(board: Board, me: int) -> Coord2:
             scored = [(_score_direct_block(board, me, mv, opp_wins_now), mv) for mv in direct]
             scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2]), reverse=True)
             return scored[0][1]
+        # ダイレクト不可 → after==0 > after最小
         best = None; best_after = 10**9
         for (x, y) in _center_sorted(moves):
             z = place_inplace(board, x, y, me)
@@ -464,17 +480,17 @@ def choose_best(board: Board, me: int) -> Coord2:
                 best_after = after; best = (x, y)
         return best if best is not None else _center_sorted(moves)[0]
 
+    # 2.3) ★ 脅威だけ浅読み（自殺手/ t支えは除外）
+    mv_ts = threat_space_best_move(board, me, max_depth=2)
+    if mv_ts is not None:
+        return mv_ts
+
     # 2.4) 逆ミッキー“完成”→サイド直行
     mv_rm = find_reverse_mickey_side_move(board, me)
-    if mv_rm is not None:
-        return mv_rm
-
-    # ==== NEW (Fu) ==== 2.45) フ型“完成”→サイド直行
-    mv_fu = find_fu_side_finish_move(board, me)
-    if mv_fu is not None:
-        # 念のための最低限安全チェック
-        if not is_t_support_move(board, me, mv_fu[0], mv_fu[1]):
-            return mv_fu
+    if mv_rm is not None and mv_rm in valid_xy_moves(board):
+        # 念のため危険手でないかを確認（極端な自殺手は避ける）
+        if not is_suicide_move(board, me, mv_rm[0], mv_rm[1]) and not is_t_support_move(board, me, mv_rm[0], mv_rm[1]):
+            return mv_rm
 
     # 2.5) 逆ミッキー“作成”狙い（DT）
     best_rm_move: Optional[Coord2] = None
@@ -493,13 +509,13 @@ def choose_best(board: Board, me: int) -> Coord2:
     if best_rm_move is not None:
         return best_rm_move
 
-    # 3) 角1層（安全フィルタ）
+    # 3) 角1層（安全フィルタを通す）
     for (x, y) in CORNERS:
         if (x, y) in moves and lowest_empty_z(board, x, y) == 0:
             if (x, y) in safe_filter_moves(board, me, [(x, y)]):
                 return (x, y)
 
-    # 4) 中央 2〜3層（安全フィルタ）
+    # 4) 中央 2〜3層（安全フィルタを通す）
     for (x, y) in CENTERS:
         if (x, y) in moves:
             z = lowest_empty_z(board, x, y)
@@ -507,7 +523,7 @@ def choose_best(board: Board, me: int) -> Coord2:
                 if (x, y) in safe_filter_moves(board, me, [(x, y)]):
                     return (x, y)
 
-    # 5) 辺 2〜3層（行/列角に自石）→ 側面形最大化（安全フィルタ）
+    # 5) 辺（2〜3層 & 行/列角に自石）→ 側面ターゲット形最大化（安全フィルタを通す）
     edge_cands: List[Coord2] = []
     for (x, y) in EDGES:
         if (x, y) in moves:
@@ -531,17 +547,17 @@ def choose_best(board: Board, me: int) -> Coord2:
             if (x, y) in safe_filter_moves(board, me, [(x, y)]):
                 return (x, y)
 
-    # 7) 中央寄りフォールバック（安全フィルタ）
+    # 7) 中央寄りフォールバック（安全フィルタで置換）
     fallback = _center_sorted(moves)
     fallback = safe_filter_moves(board, me, fallback)
     return fallback[0]
 
-# ---------- エンジン ----------
+# ---------- エンジン（最終ガード付き） ----------
 class MyAI(Alg3D):
     def get_move(self, board: Board, player: int, last_move: Coord3) -> Coord2:
         try:
             mv = choose_best(board, player)
-            mv = force_block_guard(board, player, mv)
+            mv = force_block_guard(board, player, mv)   # ★最後の安全弁：ブロック必須なら差し替え
             ms = valid_xy_moves(board)
             return mv if mv in ms else (ms[0] if ms else (0, 0))
         except Exception:
