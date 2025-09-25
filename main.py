@@ -229,7 +229,7 @@ def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
     moves = valid_xy_moves(board)
     direct = [mv for mv in moves if mv in opp_set]
     if direct:
-        scored = [(_score_direct_block(board, me, mv, list(opp_set))), mv) for mv in direct]
+        scored = [(_score_direct_block(board, me, mv, list(opp_set)), mv) for mv in direct]  # ← 修正済み
         scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2]), reverse=True)
         return scored[0][1]
     # ダイレクト不可 → after==0 を最優先、なければ after 最小化
