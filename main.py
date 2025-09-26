@@ -298,14 +298,115 @@ def induces_opponent_double_threat_next(board: Board, me: int, x: int, y: int) -
     return bad
 
 def safe_filter_moves(board: Board, me: int, moves: List[Coord2]) -> List[Coord2]:
+    """
+    危険手を除外して返すフィルタ。
+    許可（早期return対象）:
+      - 自分の即勝ち手
+      - 相手の即勝ちを直接ブロックする手
+    除外:
+      - 無目的トップキャップ（is_bad_top_cap）
+      - 自分の着手で相手の“≤2手到達”脅威が増える手
+      - 自殺手（is_suicide_move）
+      - t点支え（is_t_support_move）
+    ※ 全滅した場合は moves をそのまま返す（合法手ゼロは避ける）。
+    """
+    you = 3 - me
+    if not moves:
+        return []
+
+    # 相手の“即勝ち”着点（ダイレクトブロックは常に許可）
+    opp_now = set(immediate_winning_squares_try(board, you))
+    # 相手の“≤2手到達”脅威（事前値）
+    before2 = collect_reachable_threats(board, you, max_steps=2)
+
     safe: List[Coord2] = []
     for (x, y) in moves:
-        if is_suicide_move(board, me, x, y):      continue
-        if is_t_support_move(board, me, x, y):    continue
-        if _max_opp_dt_after_reply(board, me, x, y) >= 2: continue
-        if induces_opponent_double_threat_next(board, me, x, y): continue
+        # 自分の即勝ち or 相手の即勝ちブロック は無条件で許可
+        if is_winning_after(board, me, x, y) or (x, y) in opp_now:
+            safe.append((x, y))
+            continue
+
+        # 無目的トップキャップ（you_c>=2でz==3、you_c>=1でz==2）は除外
+        if is_bad_top_cap(board, me, x, y):
+            continue
+
+        # 自分の着手で“相手の≤2手到達脅威”が増えるなら除外
+        ztmp = place_inplace(board, x, y, me)
+        if ztmp is not None:
+            after2 = collect_reachable_threats(board, you, max_steps=2)
+            undo_place(board, x, y, ztmp)
+            if len(after2) > len(before2):
+                continue
+        else:
+            # 置けないマス（通常は来ない）
+            continue
+
+        # 自殺手 / t点支え は除外
+        if is_suicide_move(board, me, x, y):
+            continue
+        if is_t_support_move(board, me, x, y):
+            continue
+
         safe.append((x, y))
+
     return safe if safe else moves
+
+def is_purposeful_in_same_column(board: Board, me: int, x: int, y: int) -> bool:
+    """同じ列に入ることが『即勝ち』or『相手の即勝ちを直接1本以上潰す』目的になっているか？"""
+    you = 3 - me
+    # 自分即勝ちならOK
+    if is_winning_after(board, me, x, y):
+        return True
+    # 置く前の相手即勝ち本数
+    base = len(immediate_winning_squares_try(board, you))
+    z = place_inplace(board, x, y, me)
+    if z is None:
+        return False
+    aft = len(immediate_winning_squares_try(board, you))
+    undo_place(board, x, y, z)
+    # 1本以上潰せていれば“目的あり”
+    return aft < base
+
+def is_bad_top_cap(board: Board, me: int, x: int, y: int) -> bool:
+    """目的のない z==3（または z==2）キャップを禁止。
+       you_c>=2 & z==3 / you_c>=1 & z==2 を、目的なしなら False（＝除外）にする。"""
+    z = lowest_empty_z(board, x, y)
+    if z is None: return False
+    me_c, you_c = vertical_profile(board, me, x, y)
+    # 目的があれば許可
+    if is_purposeful_in_same_column(board, me, x, y):
+        return False
+    if you_c >= 2 and z == 3:  # 最上段の無意味キャップ
+        return True
+    if you_c >= 1 and z == 2:  # 上から2段目の無意味キャップ
+        return True
+    return False
+
+def collect_reachable_threats(board: Board, player: int, max_steps: int = 2) -> Set[Coord2]:
+    """playerの“空き1つライン”の到達脅威(≤max_steps)の着点(=その空きの (x,y))を返す。"""
+    res: Set[Coord2] = set()
+    you = 3 - player
+    for line in ALL_LINES:
+        cnt_p = cnt_y = 0
+        empty: Optional[Coord3] = None
+        for (x,y,z) in line:
+            v = board[z][y][x]
+            if v == player: cnt_p += 1
+            elif v == you:  cnt_y += 1
+            else:           empty = (x,y,z)
+        if cnt_y == 0 and cnt_p == 3 and empty is not None:
+            ex, ey, ez = empty
+            le = lowest_empty_z(board, ex, ey)
+            if le is None: 
+                continue
+            # 1手到達
+            if le == ez and max_steps >= 1:
+                res.add((ex,ey))
+            # 2手到達（同列に1手積むと到達）
+            if le == ez-1 and max_steps >= 2:
+                res.add((ex,ey))
+    return res
+
 
 # ---------- ブロック ----------
 def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Coord2]) -> Tuple[int,int,int]:
@@ -578,6 +679,22 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
             if after < best_after:
                 best_after = after; best = (x, y)
         return best if best is not None else _center_sorted(moves)[0]
+
+	# 2.05) 相手の“≤2手到達”脅威 列を前もって潰す（同列でz==1/2を優先）
+    opp2 = collect_reachable_threats(board, you, 2)  # (x,y)集合
+    if opp2:
+        pre_blocks: List[Coord2] = []
+        for (x, y) in moves:
+            z = lowest_empty_z(board, x, y)
+            if z is None: continue
+            # その列が脅威着点になっているなら、z==1/2のうち安全な方を優先
+            if (x, y) in opp2 and z in (1,2):
+                pre_blocks.append((x, y))
+        pre_blocks = safe_filter_moves(board, me, pre_blocks)
+        if pre_blocks:
+            # さらに“目的のないトップキャップ”は落ちるので自然に良手が残る
+            pre_blocks.sort(key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
+            return pre_blocks[0]
 
     # 2.1) ★角(z==0)の強制優先（先手・後手共通）
     # 先手: 角が空いている限り必ず角へ
