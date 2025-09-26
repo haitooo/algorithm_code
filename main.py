@@ -1,13 +1,12 @@
 # main.py
 # 4x4x4 立体四目並べ AI — 角(z==0)強制優先 + 脅威空間(IDS) + 全76ライン評価 + 低深度AB
-# 追加強化（再改訂）:
-#  (A) 置いた直後に相手が最善1手を指すときの「相手即勝マス最大値」を最小化（各所で採用）
+# 追加強化（安定化版）:
+#  (A) 自手直後に相手が最善1手を指すときの「相手即勝マス最大値」を最小化（各所で採用）
 #  (B) 緊急縦クランプを角より優先（z==3直前も対象）
 #  (C) force_block_guard を direct/indirect ともに (A) で選別
-#  (D) Hard Block Gate 後に“なお即勝が残る”場合の最終強制ブロック
-#  (E) 角/中央/最終フォールバック返却直前でも (A) を必ず噛ませる
-#
-# 禁止API未使用（I/O・並列・eval/exec/open 等ゼロ）
+#  (D) Hard Block Gate 後でも“今の相手即勝”が残るなら必ず direct block へ差し替え
+#  (E) 角/中央/最終フォールバック返却直前にも (A) を噛ませる
+#  (F) 例外/非法手時の多重フォールバックを強化（異常終了防止）
 
 from typing import List, Tuple, Optional, Dict, Set
 import time
@@ -20,7 +19,7 @@ SIZE = 4
 # ---- 探索予算 ----
 TIME_BUDGET_SEC = 9.5
 TS_MAX_DEPTH    = 5
-THREAT_BEAM     = 18   # ← 少し増やす
+THREAT_BEAM     = 18
 AB_MAX_DEPTH    = 3
 
 # ---------- 基本ユーティリティ ----------
@@ -202,9 +201,13 @@ def is_suicide_move(board: Board, me: int, x: int, y: int) -> bool:
 def safe_filter_moves(board: Board, me: int, moves: List[Coord2]) -> List[Coord2]:
     safe: List[Coord2] = []
     for (x,y) in moves:
-        if is_suicide_move(board, me, x, y):   continue
-        if is_t_support_move(board, me, x, y): continue
-        safe.append((x,y))
+        try:
+            if is_suicide_move(board, me, x, y):   continue
+            if is_t_support_move(board, me, x, y): continue
+            safe.append((x,y))
+        except Exception:
+            # 何かおかしくなっても候補自体は落とさない
+            safe.append((x,y))
     return safe if safe else moves
 
 # ---------- 角周り補助 ----------
@@ -240,45 +243,58 @@ def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Co
 
 # --- 1手先の相手即勝“最大値”を最小化 ---
 def _max_opp_immediate_after_reply(board: Board, me: int, x: int, y: int, beam: int = 14) -> int:
-    you = 3 - me
-    z0 = place_inplace(board, x, y, me)
-    if z0 is None:
-        return 99
-    moves = valid_xy_moves(board)
-    opp_now = _opp_immediate_now_union(board, you)
-    cand: List[Coord2] = [mv for mv in moves if mv in opp_now]
-    if len(cand) < beam:
-        for mv in _center_sorted(moves):
-            if mv not in cand:
-                cand.append(mv)
-            if len(cand) >= beam:
-                break
-    worst = 0
-    for (ox, oy) in cand:
-        z1 = place_inplace(board, ox, oy, you)
-        if z1 is None: continue
-        cnt = len(_opp_immediate_now_union(board, you))
-        if cnt > worst: worst = cnt
-        undo_place(board, ox, oy, z1)
-        if worst >= 2: break
-    undo_place(board, x, y, z0)
-    return worst
+    try:
+        you = 3 - me
+        z0 = place_inplace(board, x, y, me)
+        if z0 is None:
+            return 99
+        moves = valid_xy_moves(board)
+        opp_now = _opp_immediate_now_union(board, you)
+        cand: List[Coord2] = [mv for mv in moves if mv in opp_now]
+        if len(cand) < beam:
+            for mv in _center_sorted(moves):
+                if mv not in cand:
+                    cand.append(mv)
+                if len(cand) >= beam:
+                    break
+        worst = 0
+        for (ox, oy) in cand:
+            z1 = place_inplace(board, ox, oy, you)
+            if z1 is None: continue
+            cnt = len(_opp_immediate_now_union(board, you))
+            if cnt > worst: worst = cnt
+            undo_place(board, ox, oy, z1)
+            if worst >= 2: break
+        undo_place(board, x, y, z0)
+        return worst
+    except Exception:
+        # 何かあっても危険寄りで扱う
+        return 2
 
 def _choose_by_minimax_opp_after(board: Board, me: int, moves: List[Coord2], beam: int = 14) -> Optional[Coord2]:
     if not moves: return None
     best_mv = moves[0]; best_key = (999, 9.9)
     for (x, y) in moves:
-        w = _max_opp_immediate_after_reply(board, me, x, y, beam=beam)
-        key = (w, abs(1.5 - x) + abs(1.5 - y))
-        if key < best_key:
-            best_mv = (x, y); best_key = key
-            if w == 0: break
+        try:
+            w = _max_opp_immediate_after_reply(board, me, x, y, beam=beam)
+            key = (w, abs(1.5 - x) + abs(1.5 - y))
+            if key < best_key:
+                best_mv = (x, y); best_key = key
+                if w == 0: break
+        except Exception:
+            # 評価失敗時は中央寄り優先
+            k2 = (999, abs(1.5 - x) + abs(1.5 - y))
+            if k2 < best_key:
+                best_mv = (x, y); best_key = k2
     return best_mv
 
 def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
     # 自分が今すぐ勝てるならそのまま
-    my_now = immediate_winning_squares_try(board, me)
-    if my_now: return chosen
+    try:
+        my_now = immediate_winning_squares_try(board, me)
+        if my_now: return chosen
+    except Exception:
+        pass
 
     opp_now = _opp_immediate_now_union(board, 3-me)
     if not opp_now: return chosen
@@ -293,18 +309,20 @@ def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
         if best is not None:
             return best
 
-    # 間接ブロック：相手の今の即勝総数を減らしつつ、先の最大即勝も最小に
+    # 間接ブロック
     best_mv = None; best_key = (999, 9.9)
     for (x, y) in _center_sorted(moves):
         z = place_inplace(board, x, y, me)
         if z is None: continue
-        after = len(_opp_immediate_now_union(board, 3-me))
-        worst = _max_opp_immediate_after_reply(board, me, x, y, beam=12)
-        undo_place(board, x, y, z)
-        key = (after, worst, abs(1.5 - x) + abs(1.5 - y))
+        try:
+            after = len(_opp_immediate_now_union(board, 3-me))
+            worst = _max_opp_immediate_after_reply(board, me, x, y, beam=12)
+            key = (after, worst, abs(1.5 - x) + abs(1.5 - y))
+        finally:
+            undo_place(board, x, y, z)
         if key < best_key:
             best_key = key; best_mv = (x, y)
-        if after == 0 and worst == 0:
+        if best_key[0] == 0 and best_key[1] == 0:
             break
     if best_mv is not None:
         return best_mv
@@ -516,7 +534,7 @@ def urgent_vertical_clamp(board: Board, me: int) -> Optional[Coord2]:
     if not moves: return None
     you = 3 - me
 
-    # 相手が z==3 直前で3個揃う列（=置かれると即勝）を最優先
+    # 相手が z==3 直前で3個揃う列を最優先
     for (x, y) in moves:
         z = lowest_empty_z(board, x, y)
         if z == 3:
@@ -569,13 +587,15 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
         for (x, y) in _center_sorted(moves):
             z = place_inplace(board, x, y, me)
             if z is None: continue
-            after = len(_opp_immediate_now_union(board, 3-me))
-            worst = _max_opp_immediate_after_reply(board, me, x, y, beam=12)
-            undo_place(board, x, y, z)
-            key = (after, worst, abs(1.5 - x) + abs(1.5 - y))
+            try:
+                after = len(_opp_immediate_now_union(board, 3-me))
+                worst = _max_opp_immediate_after_reply(board, me, x, y, beam=12)
+                key = (after, worst, abs(1.5 - x) + abs(1.5 - y))
+            finally:
+                undo_place(board, x, y, z)
             if key < best_key:
                 best_key = key; best = (x, y)
-            if after == 0 and worst == 0:
+            if best_key[0] == 0 and best_key[1] == 0:
                 break
         if best is not None:
             return best
@@ -590,13 +610,14 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
     if corner0:
         if me == 2:
             lx, ly, lz = last_move
-            if (lx,ly) in CORNERS and lz == 0:
-                others = [(x, y) for (x, y) in corner0 if (x, y) != (lx, ly)]
-                if others:
-                    cands = safe_filter_moves(board, me, others) or others
-                    mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=12)
-                    if mv_mm is not None: return mv_mm
-                    return _center_sorted(cands)[0]
+            if isinstance(lx, int) and isinstance(ly, int) and isinstance(lz, int):
+                if (lx,ly) in CORNERS and lz == 0:
+                    others = [(x, y) for (x, y) in corner0 if (x, y) != (lx, ly)]
+                    if others:
+                        cands = safe_filter_moves(board, me, others) or others
+                        mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=12)
+                        if mv_mm is not None: return mv_mm
+                        return _center_sorted(cands)[0]
         cands = safe_filter_moves(board, me, corner0) or corner0
         mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=12)
         if mv_mm is not None: return mv_mm
@@ -655,7 +676,7 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
         return mv_mm
     return _center_sorted(cands)[0]
 
-# ---------- “最終関門” Hard Block Gate（強化: 最終強制ブロック） ----------
+# ---------- “最終関門” Hard Block Gate（強化: 最終強制ブロック + 例外耐性） ----------
 def hard_block_gate(board: Board, me: int, proposed: Coord2) -> Coord2:
     legal = valid_xy_moves(board)
     if not legal:
@@ -664,37 +685,46 @@ def hard_block_gate(board: Board, me: int, proposed: Coord2) -> Coord2:
         return legal[0]
 
     # 自即勝はそのまま
-    my_now = _opp_immediate_now_union(board, me)
-    if proposed in my_now:
-        return proposed
+    try:
+        my_now = _opp_immediate_now_union(board, me)
+        if proposed in my_now:
+            return proposed
+    except Exception:
+        pass
 
-    wx, wy = proposed
-    worst = _max_opp_immediate_after_reply(board, me, wx, wy, beam=14)
+    try:
+        wx, wy = proposed
+        worst = _max_opp_immediate_after_reply(board, me, wx, wy, beam=14)
 
-    # 相手即勝フォーク(>=2)なら候補全体から最小化で差し替え
-    if worst >= 2:
-        safe = _choose_by_minimax_opp_after(board, me, legal, beam=14)
-        if safe is not None:
-            proposed = safe
+        # 相手即勝フォーク(>=2)なら候補全体から最小化で差し替え
+        if worst >= 2:
+            safe = _choose_by_minimax_opp_after(board, me, legal, beam=14)
+            if safe is not None:
+                proposed = safe
 
-    # ★ Gate通過後でも“今の相手即勝”がまだ残るなら、必ず direct block へ差し替え
-    opp_now = _opp_immediate_now_union(board, 3 - me)
-    if opp_now:
-        direct = [mv for mv in legal if mv in opp_now]
-        if direct:
-            best = _choose_by_minimax_opp_after(board, me, direct, beam=14)
-            if best is not None:
-                return best
+        # Gate通過後でも“今の相手即勝”が残るなら、必ず direct block に差し替え
+        opp_now = _opp_immediate_now_union(board, 3 - me)
+        if opp_now:
+            direct = [mv for mv in legal if mv in opp_now]
+            if direct:
+                best = _choose_by_minimax_opp_after(board, me, direct, beam=14)
+                if best is not None:
+                    return best
 
-    # まだ危険度 1 が改善できるなら置換
-    better: List[Coord2] = []
-    cur_worst = _max_opp_immediate_after_reply(board, me, proposed[0], proposed[1], beam=12)
-    for (x, y) in legal:
-        w = _max_opp_immediate_after_reply(board, me, x, y, beam=12)
-        if w < cur_worst:
-            better.append((x, y))
-    if better:
-        return _choose_by_minimax_opp_after(board, me, better, beam=12) or better[0]
+        # まだ危険度 1 が改善できるなら置換
+        cur_worst = _max_opp_immediate_after_reply(board, me, proposed[0], proposed[1], beam=12)
+        better: List[Coord2] = []
+        for (x, y) in legal:
+            w = _max_opp_immediate_after_reply(board, me, x, y, beam=12)
+            if w < cur_worst:
+                better.append((x, y))
+        if better:
+            alt = _choose_by_minimax_opp_after(board, me, better, beam=12)
+            if alt is not None:
+                proposed = alt
+    except Exception:
+        # 何があっても合法手から中央寄りにフォールバック
+        return _center_sorted(legal)[0]
 
     return proposed
 
@@ -704,8 +734,11 @@ class MyAI(Alg3D):
         deadline = time.perf_counter() + TIME_BUDGET_SEC
         try:
             mv = choose_best(board, player, deadline, last_move)
+            # まず“今の即勝”を確実に塞ぐ
             mv = force_block_guard(board, player, mv)
+            # 次に、置いた直後に生じるフォーク誘発を最小化
             mv = hard_block_gate(board, player, mv)
+            # 最終合法チェック
             legal = valid_xy_moves(board)
             return mv if mv in legal else (legal[0] if legal else (0,0))
         except Exception:
