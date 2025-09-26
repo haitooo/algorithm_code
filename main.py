@@ -1,13 +1,12 @@
 # main.py
 # 4x4x4 立体四目並べ AI — 角(z==0)強制優先 + 脅威空間(IDS) + 全76ライン評価 + 低深度AB
-# 変更点:
-#  (1) ブロック系(直/間接)と緊急縦クランプを角より優先
-#  (2) 「こちらが置いた直後の相手即勝数」を最小化する1手先ミニマックスを導入
-#  (3) force_block_guard の相手即勝ち検出を2系統の合併集合で強化
-#  (4) 縦クランプに z==3 直前(相手3個)も追加
-#  (5) 候補束/探索深さを拡大: THREAT_BEAM=16, TS_MAX_DEPTH=5
+# 追加強化:
+#  (A) 置いた直後に相手が最善1手を指すときの「相手即勝数の最大値」を最小化して手を選ぶ
+#  (B) 緊急縦クランプを角より優先（z==3直前も対象）
+#  (C) force_block_guard は2系統の即勝検出を合併
+#  (D) 角/中央/最終フォールバック返却直前に (A) を必ず噛ませて危険最小化
 #
-# 禁止API: すべて未使用（I/O・並列なし）。標準libの time / typing のみ。
+# 禁止APIは未使用（I/O・並列・eval/exec 等ゼロ）。標準libの time / typing のみ。
 
 from typing import List, Tuple, Optional, Dict, Set
 import time
@@ -19,8 +18,8 @@ SIZE = 4
 
 # ---- 探索予算 ----
 TIME_BUDGET_SEC = 9.5       # 全体思考時間
-TS_MAX_DEPTH    = 5         # 脅威空間 IDS 深さ（拡大）
-THREAT_BEAM     = 16        # 脅威候補束（拡大）
+TS_MAX_DEPTH    = 5         # 脅威空間 IDS 深さ
+THREAT_BEAM     = 16        # 脅威候補束
 AB_MAX_DEPTH    = 3         # 最終保険のミニαβ最大深さ
 
 # ---------- 基本ユーティリティ ----------
@@ -223,7 +222,7 @@ def column_has_my_stone(board: Board, me: int, x: int, y: int) -> bool:
             return True
     return False
 
-# ---------- 即ブロック ----------
+# ---------- 相手“今の”即勝を強制ブロック ----------
 def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Coord2]) -> Tuple[int,int,int]:
     x,y = mv
     z = place_inplace(board, x, y, me)
@@ -475,15 +474,6 @@ def opponent_focus_columns(board: Board, me: int) -> List[Coord2]:
     stats.sort(reverse=True)
     return [p for _,__,p in stats]
 
-def vertical_profile(board: Board, player: int, x: int, y: int) -> Tuple[int,int]:
-    you = 3 - player
-    c_me = c_you = 0
-    for z in range(SIZE):
-        v = board[z][y][x]
-        if v == player: c_me += 1
-        elif v == you:  c_you += 1
-    return c_me, c_you
-
 def urgent_vertical_clamp(board: Board, me: int) -> Optional[Coord2]:
     moves = valid_xy_moves(board)
     if not moves: return None
@@ -517,7 +507,62 @@ def urgent_vertical_clamp(board: Board, me: int) -> Optional[Coord2]:
     prio.sort(reverse=True)
     return prio[0][3]
 
-# ---------- 1手先の相手即勝最小化（新規） ----------
+# ---------- 1手先の相手即勝“最大値”を最小化（新規） ----------
+def _max_opp_immediate_after_reply(board: Board, me: int, x: int, y: int, beam: int = 10) -> int:
+    """
+    自分 me が (x,y) に置いた直後、相手がベストの1手を打ったときの
+    相手側即勝マス数の「最大値」を返す（ビームで軽量化）。
+    """
+    you = 3 - me
+    z0 = place_inplace(board, x, y, me)
+    if z0 is None:
+        return 99  # 非合法は最大ペナルティ扱い
+
+    moves = valid_xy_moves(board)
+    wins_opp_now = set(immediate_winning_squares_try(board, you))
+    cand: List[Coord2] = []
+
+    # 相手の即勝手を最優先で候補化
+    cand += [mv for mv in moves if mv in wins_opp_now]
+
+    # 少なければ中心寄りで補完
+    if len(cand) < beam:
+        rest = [mv for mv in _center_sorted(moves) if mv not in cand]
+        cand += rest[:max(0, beam - len(cand))]
+
+    worst = 0
+    for (ox, oy) in cand:
+        z1 = place_inplace(board, ox, oy, you)
+        if z1 is None:
+            continue
+        cnt = len(immediate_winning_squares_try(board, you))
+        if cnt > worst: worst = cnt
+        undo_place(board, ox, oy, z1)
+        if worst >= 2:  # ダブルリーチ以上が見えたら十分に危険
+            break
+
+    undo_place(board, x, y, z0)
+    return worst
+
+def _choose_by_minimax_opp_after(board: Board, me: int, moves: List[Coord2], beam: int = 10) -> Optional[Coord2]:
+    """候補 moves の中から、相手即勝“最大値”を最小にする手を選ぶ。"""
+    if not moves:
+        return None
+    best_mv = moves[0]; best_val = 10**9
+    def cent(p: Coord2) -> float:
+        return abs(1.5 - p[0]) + abs(1.5 - p[1])
+    for (x, y) in moves:
+        val = _max_opp_immediate_after_reply(board, me, x, y, beam=beam)
+        key_cur  = (val, cent((x,y)))
+        key_best = (best_val, cent(best_mv))
+        if key_cur < key_best:
+            best_val = val
+            best_mv  = (x, y)
+            if val == 0:
+                break
+    return best_mv
+
+# （平均的な“相手即勝数”の最小化が欲しければ、必要に応じて下を併用可能）
 def _minimize_opp_immediate_after(board: Board, me: int, moves: List[Coord2]) -> Optional[Coord2]:
     if not moves: return None
     you = 3 - me
@@ -533,7 +578,7 @@ def _minimize_opp_immediate_after(board: Board, me: int, moves: List[Coord2]) ->
                 break
     return best_mv
 
-# ---------- 手選択（改良順序） ----------
+# ---------- 手選択（改良順序 + 危険最小化） ----------
 def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Coord2:
     moves = valid_xy_moves(board)
     if not moves: return (0,0)
@@ -578,11 +623,17 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
                 others = [(x, y) for (x, y) in corner0 if (x, y) != (lx, ly)]
                 if others:
                     cands = safe_filter_moves(board, me, others) or others
-                    mv = _minimize_opp_immediate_after(board, me, cands) or sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
-                    return mv
+                    # ★相手最善1手の“最大値”最小化で決定
+                    mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=10)
+                    if mv_mm is not None:
+                        return mv_mm
+                    # フォールバック
+                    return sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
         cands = safe_filter_moves(board, me, corner0) or corner0
-        mv = _minimize_opp_immediate_after(board, me, cands) or sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
-        return mv
+        mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=10)
+        if mv_mm is not None:
+            return mv_mm
+        return sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
 
     # 4) 中央クランプ（z∈{1,2}）
     center_cands = [(x,y) for (x,y) in CENTERS
@@ -600,8 +651,11 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
             scored.append(((delta, cbias), (x,y)))
         scored.sort(key=lambda t: t[0], reverse=True)
         cands = [mv for _,mv in scored]
-        mv = _minimize_opp_immediate_after(board, me, cands) or cands[0]
-        return mv
+        # ★最大値最小化で決定
+        mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=10)
+        if mv_mm is not None:
+            return mv_mm
+        return cands[0]
 
     # 5) 辺(2,3層)で側面形を拡大（自列に角があるエッジ優先）
     edge_cands: List[Coord2] = []
@@ -629,8 +683,11 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
     if mv_ab is not None:
         return mv_ab
 
-    # 8) 最終フォールバック：中央寄りの安全手
+    # 8) 最終フォールバック：中央寄りの安全手（★最大値最小化）
     cands = safe_filter_moves(board, me, moves)
+    mv_mm = _choose_by_minimax_opp_after(board, me, cands, beam=10)
+    if mv_mm is not None:
+        return mv_mm
     return _center_sorted(cands)[0]
 
 # ---------- エンジン ----------
