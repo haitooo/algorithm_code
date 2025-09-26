@@ -174,6 +174,94 @@ def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> 
     undo_place(board, x, y, z)
     return sc
 
+def _opp_immediate_now_union(board: Board, player: int) -> Set[Coord2]:
+    # 2系統の即勝検出の合併（取りこぼし防止）
+    return set(immediate_winning_squares_try(board, player)) | set(line_immediate_winning_moves(board, player))
+
+def _max_opp_immediate_after_reply(board: Board, me: int, x: int, y: int, beam: int = 12) -> int:
+    # 既出と同等：自手m後、相手最善1手で発生する「相手の即勝マス数」の最大値
+    you = 3 - me
+    z0 = place_inplace(board, x, y, me)
+    if z0 is None:
+        return 99
+    moves = valid_xy_moves(board)
+    opp_now = _opp_immediate_now_union(board, you)
+    cands: List[Coord2] = [mv for mv in moves if mv in opp_now]
+    if len(cands) < beam:
+        for mv in _center_sorted(moves):
+            if mv not in cands:
+                cands.append(mv)
+            if len(cands) >= beam:
+                break
+    worst = 0
+    for (ox, oy) in cands:
+        z1 = place_inplace(board, ox, oy, you)
+        if z1 is None:
+            continue
+        cnt = len(_opp_immediate_now_union(board, you))
+        if cnt > worst:
+            worst = cnt
+        undo_place(board, ox, oy, z1)
+        if worst >= 2:
+            break
+    undo_place(board, x, y, z0)
+    return worst
+
+def _choose_by_minimax_opp_after(board: Board, me: int, moves: List[Coord2], beam: int = 12) -> Optional[Coord2]:
+    # 候補の中から “相手最善一発後の即勝マス数（最大値）” を最小化
+    if not moves:
+        return None
+    best = moves[0]; best_key = (999, 9.9)
+    for (x, y) in moves:
+        w = _max_opp_immediate_after_reply(board, me, x, y, beam=beam)
+        key = (w, abs(1.5 - x) + abs(1.5 - y))  # 同値なら中央寄り
+        if key < best_key:
+            best = (x, y); best_key = key
+            if w == 0:
+                break
+    return best
+
+def hard_block_gate(board: Board, me: int, proposed: Coord2) -> Coord2:
+    """どの経路で選ばれた手でも、致命的な“即勝フォーク”を生むなら安全手に差し替える。"""
+    legal = valid_xy_moves(board)
+    if not legal:
+        return proposed
+    if proposed not in legal:
+        # すでに非合法なら単純フォールバック
+        return legal[0]
+
+    # 自即勝はそのまま通す
+    my_now = _opp_immediate_now_union(board, me)
+    if proposed in my_now:
+        return proposed
+
+    # 提案手の危険度を測る
+    wx, wy = proposed
+    worst = _max_opp_immediate_after_reply(board, me, wx, wy, beam=12)
+
+    # すでに“相手即勝フォーク（>=2）”の危険なら、候補全体から最小化で差し替え
+    if worst >= 2:
+        safe = _choose_by_minimax_opp_after(board, me, legal, beam=12)
+        if safe is not None:
+            return safe
+
+    # 1でも、より安全な手があるなら置き換え（ただし同時に“今の即勝”は必ずブロック）
+    cur_now = len(_opp_immediate_now_union(board, 3 - me))
+    better: List[Coord2] = []
+    for (x, y) in legal:
+        w = _max_opp_immediate_after_reply(board, me, x, y, beam=10)
+        if w < worst:
+            better.append((x, y))
+    if better:
+        # “今の相手即勝”を塞ぐ手が better にあるなら最優先
+        opp_now = _opp_immediate_now_union(board, 3 - me)
+        block_better = [mv for mv in better if mv in opp_now]
+        if block_better:
+            return _choose_by_minimax_opp_after(board, me, block_better, beam=10) or block_better[0]
+        return _choose_by_minimax_opp_after(board, me, better, beam=10) or better[0]
+
+    return proposed
+
 # ---------- 安全系（自殺・t支え） ----------
 def is_t_support_move(board: Board, me: int, x: int, y: int) -> bool:
     # z==2 に置くと、相手が同列に置いて z==3 で勝てる「支え」になる場合を避ける
@@ -697,6 +785,7 @@ class MyAI(Alg3D):
         try:
             mv = choose_best(board, player, deadline, last_move)
             mv = force_block_guard(board, player, mv)
+			mv = hard_block_gate(board, player, mv)
             legal = valid_xy_moves(board)
             return mv if mv in legal else (legal[0] if legal else (0,0))
         except Exception:
