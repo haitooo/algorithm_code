@@ -225,6 +225,54 @@ def find_reverse_mickey_side_move(board: Board, me: int) -> Optional[Coord2]:
             best_dt = my_dt; best_mv = (x, y)
     return best_mv
 
+# === 追加: 盤情報ユーティリティ ===
+def board_stone_counts(board: Board) -> Tuple[int, int]:
+    me_cnt = you_cnt = 0  # 呼び出し側で me を知らないため全体数だけ返す（使い道は「総着手数」）
+    for z in range(SIZE):
+        for y in range(SIZE):
+            for x in range(SIZE):
+                v = board[z][y][x]
+                if v == 0: continue
+                if v == 1: me_cnt += 1
+                else:      you_cnt += 1
+    return (me_cnt, you_cnt)
+
+def is_corner_xy(x: int, y: int) -> bool:
+    return (x, y) in [(0,0),(3,0),(0,3),(3,3)]
+
+def is_inner_xy(x: int, y: int) -> bool:
+    # 角以外（＝辺と中央の総称）
+    return not is_corner_xy(x, y)
+
+# === 追加: オープニング“近接応手” ===
+def opening_proximity_reply(board: Board, me: int, last_move: Coord3) -> Optional[Coord2]:
+    """
+    相手の初手が角以外なら、こちらの初手は“安全な範囲で”
+    相手に最も近い一層目(z==0)へ置く。
+    ※ 自分の即勝／相手即勝ブロックがある局面では呼び出し側で先に処理済み。
+    """
+    # まだこちらの着手がない（＝総着手数1）かチェック
+    total = sum(1 for z in range(SIZE) for y in range(SIZE) for x in range(SIZE) if board[z][y][x] != 0)
+    if total != 1:
+        return None
+
+    ox, oy, oz = last_move
+    if not is_inner_xy(ox, oy):
+        return None  # 相手が角のときは従来ロジック（角取り優先など）を使う
+
+    # 一層目で合法な手を“相手へのマンハッタン距離”昇順に並べる
+    moves = [(x, y) for (x, y) in valid_xy_moves(board) if lowest_empty_z(board, x, y) == 0]
+    if not moves:
+        return None
+
+    # 安全フィルタを通す（全滅なら moves が返ってくる仕様）
+    moves = safe_filter_moves(board, me, moves)
+
+    moves.sort(key=lambda p: (abs(p[0]-ox) + abs(p[1]-oy),   # 近いほど優先
+                              abs(1.5-p[0]) + abs(1.5-p[1]))) # 同距離なら中央寄りで
+
+    return moves[0] if moves else None
+
 # ---------- 自殺・t支え・DT誘発の禁止 ----------
 def is_t_support_move(board: Board, me: int, x: int, y: int) -> bool:
     you = 3 - me
@@ -651,24 +699,24 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
     moves = valid_xy_moves(board)
     if not moves: return (0, 0)
     you = 3 - me
-    total = count_placed(board)
 
-    # 1) 自即勝
+    # 1) 自分の即勝ち（厳密）
     my_wins_now = immediate_winning_squares_try(board, me)
     if my_wins_now:
         for mv in moves:
-            if mv in my_wins_now: return mv
+            if mv in my_wins_now:
+                return mv
         return _center_sorted(my_wins_now)[0]
 
-    # 2) 相手即勝ブロック
-    opp_wins_now = list(set(immediate_winning_squares_try(board, you)) |
-                        set(line_immediate_winning_moves(board, you)))
+    # 2) 相手の即勝ちブロック（ダイレクト最優先）
+    opp_wins_now = list(set(immediate_winning_squares_try(board, you)) | set(line_immediate_winning_moves(board, you)))
     if opp_wins_now:
         direct = [mv for mv in opp_wins_now if mv in moves]
         if direct:
             scored = [(_score_direct_block(board, me, mv, opp_wins_now), mv) for mv in direct]
             scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2]), reverse=True)
             return scored[0][1]
+        # ダイレクト不可 → after==0 > after最小
         best = None; best_after = 10**9
         for (x, y) in _center_sorted(moves):
             z = place_inplace(board, x, y, me)
@@ -680,43 +728,20 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
                 best_after = after; best = (x, y)
         return best if best is not None else _center_sorted(moves)[0]
 
-	# 2.05) 相手の“≤2手到達”脅威 列を前もって潰す（同列でz==1/2を優先）
-    opp2 = collect_reachable_threats(board, you, 2)  # (x,y)集合
-    if opp2:
-        pre_blocks: List[Coord2] = []
-        for (x, y) in moves:
-            z = lowest_empty_z(board, x, y)
-            if z is None: continue
-            # その列が脅威着点になっているなら、z==1/2のうち安全な方を優先
-            if (x, y) in opp2 and z in (1,2):
-                pre_blocks.append((x, y))
-        pre_blocks = safe_filter_moves(board, me, pre_blocks)
-        if pre_blocks:
-            # さらに“目的のないトップキャップ”は落ちるので自然に良手が残る
-            pre_blocks.sort(key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
-            return pre_blocks[0]
+    # 2.1) ★ 初手限定：相手の内側初手に“近接応手”
+    prox = opening_proximity_reply(board, me, last_move)
+    if prox is not None:
+        return prox
 
-    # 2.1) ★角(z==0)の強制優先（先手・後手共通）
-    # 先手: 角が空いている限り必ず角へ
-    # 後手: 相手が角に重ねていても（重ねず）他の z==0 角を最優先
-    corner0 = first_layer_corner_moves(board)
-    if corner0:
-        # 後手で、相手が前手で角に置いていて、かつ別角が空いているなら別角を優先
-        if me == 2:
-            lx, ly, lz = last_move
-            last_is_corner = (lx, ly) in CORNERS and lz == 0
-            if last_is_corner:
-                others = [(x, y) for (x, y) in corner0 if (x, y) != (lx, ly)]
-                if others:
-                    cands = safe_filter_moves(board, me, others)
-                    if not cands: cands = others
-                    cands.sort(key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
-                    return cands[0]
-        # それ以外は通常に角z==0を最優先（安全優先、全滅なら角を取る）
-        cands = safe_filter_moves(board, me, corner0)
-        if not cands: cands = corner0
-        cands.sort(key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
-        return cands[0]
+    # 2.2) 角 z==0（空く限り最優先・安全フィルタ） ← 先手時の既存ポリシーは維持
+    corner_first_layer: List[Coord2] = []
+    for (x, y) in CORNERS:
+        if (x, y) in moves and lowest_empty_z(board, x, y) == 0:
+            corner_first_layer.append((x, y))
+    corner_first_layer = safe_filter_moves(board, me, corner_first_layer)
+    if corner_first_layer:
+        corner_first_layer.sort(key=lambda p: (abs(1.5 - p[0]) + abs(1.5 - p[1])))
+        return corner_first_layer[0]
 
     # 2.15) 中央クランプ（センター z∈{1,2}）
     clamp = choose_center_clamp_move(board, me)
@@ -799,7 +824,7 @@ class MyAI(Alg3D):
     def get_move(self, board: Board, player: int, last_move: Coord3) -> Coord2:
         deadline = time.perf_counter() + TIME_BUDGET_SEC
         try:
-            mv = choose_best(board, player, deadline, last_move)
+            mv = choose_best(board, player, deadline, last_move)  # ← last_move を渡す
             mv = force_block_guard(board, player, mv)
             ms = valid_xy_moves(board)
             return mv if mv in ms else (ms[0] if ms else (0, 0))
