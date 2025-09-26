@@ -1,11 +1,11 @@
 # main.py
-# 4x4x4 立体四目並べ AI — 角(z==0)強制優先 + 脅威空間(IDS) + 全76ライン評価 + 低深度AB
-# 強化版:
-#  - Anti-Cap: 相手の底角( z==0 )の上に重ねる手を原則禁止（自即勝/直ブロックを除く）
-#  - Corner Pair Drive(先手): 同じ辺（行/列）の角を2つ確保できるなら最優先で狙う
-#  - 締切/ビーム制御の強化（終盤の(0,0)強制配置を抑制）
+# 4x4x4 立体四目並べ AI
+# - 角(z==0)積極取得（自分の底角が2以下なら優先、先手はペア角最優先）
+# - アンチ重ね（相手底角の上に重ねるのは原則禁止：自即勝/直ブロックのみ例外）
+# - 脅威空間IDS + 軽量AB + 全76ライン評価
+# - 直ブロック/間接ブロックの強化、時間ガード強化
 #
-# 禁止API未使用（I/O/並列/open/eval/exec 等ゼロ）
+# 禁止API未使用（I/O/並列/open/eval/exec/…全て未使用）
 
 from typing import List, Tuple, Optional, Dict, Set
 import time
@@ -15,13 +15,13 @@ Coord2 = Tuple[int, int]
 Coord3 = Tuple[int, int, int]
 SIZE = 4
 
-# ---- 探索予算 ----
-TIME_BUDGET_SEC = 9.5
-TS_MAX_DEPTH    = 5
-THREAT_BEAM     = 18
-AB_MAX_DEPTH    = 3
+# ---- 探索予算（時間ガード付きで動的に縮小）----
+TIME_BUDGET_SEC = 9.2
+TS_MAX_DEPTH    = 4      # 脅威空間 IDS 深さ（状況で縮む）
+THREAT_BEAM     = 14     # 候補束（状況で縮む）
+AB_MAX_DEPTH    = 2      # 低深度AB（保険）
 
-# ---------- 基本ユーティリティ ----------
+# ---------- 基本 ----------
 def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
     for z in range(SIZE):
         if board[z][y][x] == 0:
@@ -54,8 +54,8 @@ def _time_up(deadline: float) -> bool:
 
 def _beam_by_time(deadline: float, base: int) -> int:
     left = max(0.0, deadline - time.perf_counter())
-    if left < 0.4:  return max(6, base // 3)
-    if left < 1.0:  return max(8, base // 2)
+    if left < 0.35: return max(6, base // 3)
+    if left < 0.9:  return max(8, base // 2)
     return base
 
 def count_placed(board: Board) -> int:
@@ -100,7 +100,7 @@ for li, line in enumerate(ALL_LINES):
     for (x,y,z) in line:
         LINES_THROUGH.setdefault((x,y,z), []).append(li)
 
-# ---------- 即勝ち検出 ----------
+# ---------- 即勝 ----------
 def immediate_winning_squares_try(board: Board, player: int) -> List[Coord2]:
     wins: List[Coord2] = []
     you = 3 - player
@@ -188,7 +188,7 @@ def column_has_my_stone(board: Board, me: int, x: int, y: int) -> bool:
 def my_corner_z0(board: Board, me: int) -> List[Coord2]:
     res: List[Coord2] = []
     for (x,y) in CORNERS:
-        if lowest_empty_z(board, x, y) is not None and board[0][y][x] == me:
+        if board[0][y][x] == me:
             res.append((x,y))
     return res
 
@@ -196,7 +196,7 @@ def opp_corner_z0(board: Board, me: int) -> List[Coord2]:
     you = 3 - me
     res: List[Coord2] = []
     for (x,y) in CORNERS:
-        if lowest_empty_z(board, x, y) is not None and board[0][y][x] == you:
+        if board[0][y][x] == you:
             res.append((x,y))
     return res
 
@@ -207,7 +207,6 @@ def same_edge_pair_corners(c: Coord2) -> List[Coord2]:
     if y == 3: pairs.append((0,3))
     if x == 0: pairs.append((0,3))
     if x == 3: pairs.append((3,0))
-    # 上記だと重複の可能性があるのでユニーク化
     uniq: List[Coord2] = []
     for p in pairs:
         if p not in uniq and p != c:
@@ -352,18 +351,18 @@ def force_block_guard(board: Board, me: int, chosen: Coord2, deadline: float) ->
     moves = valid_xy_moves(board)
     direct = [mv for mv in moves if mv in opp_now]
     if direct:
-        best = _choose_by_minimax_opp_after(board, me, direct, deadline, 14)
+        best = _choose_by_minimax_opp_after(board, me, direct, deadline, 12)
         if best is not None:
             return best
 
-    best_mv = None; best_key = (999, 9.9)
+    best_mv = None; best_key = (999, 9.9, 9.9)
     for (x, y) in _center_sorted(moves):
         if _time_up(deadline): break
         z = place_inplace(board, x, y, me)
         if z is None: continue
         try:
             after = len(_opp_immediate_now_union(board, 3-me))
-            worst = _max_opp_immediate_after_reply(board, me, x, y, deadline, _beam_by_time(deadline, 12))
+            worst = _max_opp_immediate_after_reply(board, me, x, y, deadline, _beam_by_time(deadline, 10))
             key = (after, worst, abs(1.5 - x) + abs(1.5 - y))
         finally:
             undo_place(board, x, y, z)
@@ -478,7 +477,7 @@ def threat_space_best_move_iterative(board: Board, me: int, deadline: float) -> 
             root = [best_mv] + [m for m in root if m != best_mv]
     return best_mv
 
-# ---------- 全局評価（76ライン・ダブルリーチ重視） ----------
+# ---------- 全局評価 ----------
 def evaluate_full(board: Board, me: int) -> int:
     you = 3 - me
     my_th = opp_th = 0
@@ -582,6 +581,7 @@ def urgent_vertical_clamp(board: Board, me: int, deadline: float) -> Optional[Co
     if not moves: return None
     you = 3 - me
 
+    # z==3 直前で相手3個→即勝を最優先で塞ぐ
     for (x, y) in moves:
         if _time_up(deadline): break
         z = lowest_empty_z(board, x, y)
@@ -591,6 +591,7 @@ def urgent_vertical_clamp(board: Board, me: int, deadline: float) -> Optional[Co
                 if (x, y) in safe_filter_moves(board, me, [(x, y)]):
                     return (x, y)
 
+    # z==2/1 での縦圧抑止
     focus = opponent_focus_columns(board, me)
     focus_rank: Dict[Coord2, int] = {p:i for i,p in enumerate(focus)}
     prio: List[Tuple[int, int, int, Coord2]] = []
@@ -610,25 +611,25 @@ def urgent_vertical_clamp(board: Board, me: int, deadline: float) -> Optional[Co
     prio.sort(reverse=True)
     return prio[0][3]
 
-# ---------- 手選択 ----------
+# ---------- 手選択（角アグレッシブ化を強化） ----------
 def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Coord2:
     moves = valid_xy_moves(board)
     if not moves: return (0,0)
 
-    # 0) アンチ重ねのための前処理
     total = count_placed(board)
     opp_corner_bases = set(opp_corner_z0(board, me))
+    my_bases = my_corner_z0(board, me)
+
     def _anti_cap_filter(cands: List[Coord2]) -> List[Coord2]:
+        # 相手底角の上に重ねる手は原則除外（自即勝/直ブロックはこの前段で返る）
         res: List[Coord2] = []
         for (x,y) in cands:
             if (x,y) in opp_corner_bases and is_cap_on_opponent_corner(board, me, x, y):
-                # 自即勝/直ブロックでない限り除外（後で直ブロック判定が走るのでここでは弾く）
                 continue
             res.append((x,y))
         return res if res else cands
 
     # 1) 自即勝
-    if _time_up(deadline): return _center_sorted(moves)[0]
     my_now = immediate_winning_squares_try(board, me)
     if my_now:
         for mv in moves:
@@ -636,54 +637,42 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
         return _center_sorted(my_now)[0]
 
     # 2) 相手即勝ブロック（直/間接）
-    if _time_up(deadline): return _center_sorted(moves)[0]
     opp_now = _opp_immediate_now_union(board, 3-me)
     if opp_now:
         direct = [mv for mv in moves if mv in opp_now]
         if direct:
-            # 直ブロックはアンチ重ねを無視して最優先
-            best = _choose_by_minimax_opp_after(board, me, direct, deadline, 14)
+            best = _choose_by_minimax_opp_after(board, me, direct, deadline, 12)
             if best is not None:
                 return best
         # 間接ブロック
-        best = None; best_key = (999, 9.9)
+        best_mv = None; best_key = (999, 9.9, 9.9)
         for (x, y) in _center_sorted(moves):
             if _time_up(deadline): break
             z = place_inplace(board, x, y, me)
             if z is None: continue
             try:
                 after = len(_opp_immediate_now_union(board, 3-me))
-                worst = _max_opp_immediate_after_reply(board, me, x, y, deadline, _beam_by_time(deadline, 12))
+                worst = _max_opp_immediate_after_reply(board, me, x, y, deadline, _beam_by_time(deadline, 10))
                 key = (after, worst, abs(1.5 - x) + abs(1.5 - y))
             finally:
                 undo_place(board, x, y, z)
             if key < best_key:
-                best_key = key; best = (x, y)
+                best_key = key; best_mv = (x, y)
             if best_key[0] == 0 and best_key[1] == 0:
                 break
-        if best is not None:
-            return best
+        if best_mv is not None:
+            return best_mv
 
     # 2.5) 緊急縦クランプ
     vb = urgent_vertical_clamp(board, me, deadline)
     if vb is not None:
         return vb
 
-    # 3) 角(z==0) — 先手はペア角ドライブ / 後手は重ね禁止で別角優先
+    # 3) ★角(z==0)アグレッシブ：自分の底角が「2以下」かつ z==0角が空いていれば最優先
     corner0 = first_layer_corner_moves(board)
-    if corner0:
-        # 後手1巡目の特例: 相手角に"重ねず"必ず別角
-        if me == 2 and total == 1:
-            cands = [mv for mv in corner0 if mv not in opp_corner_bases]
-            cands = safe_filter_moves(board, me, cands) or cands
-            cands = _anti_cap_filter(cands)
-            best = _choose_by_minimax_opp_after(board, me, cands, deadline, 12)
-            if best is not None: return best
-            return _center_sorted(cands)[0]
-
+    if corner0 and len(my_bases) <= 2:
         if me == 1:
-            # Corner Pair Drive: 自分の底角があれば同じ辺のペア角を最優先
-            my_bases = my_corner_z0(board, me)
+            # 先手: まずペア角（同じ辺）を最優先
             drive: List[Coord2] = []
             for b in my_bases:
                 for t in same_edge_pair_corners(b):
@@ -694,27 +683,27 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
                 best = _choose_by_minimax_opp_after(board, me, cands, deadline, 12)
                 if best is not None: return best
                 return _center_sorted(cands)[0]
-
-        if me == 2:
-            # 直前が相手角z0なら別角
+            # ペアが作れない場合でも、空き底角を最優先（アンチ重ね適用）
+            cands = _anti_cap_filter(corner0)
+            cands = safe_filter_moves(board, me, cands) or cands
+            best = _choose_by_minimax_opp_after(board, me, cands, deadline, 12)
+            if best is not None: return best
+            return _center_sorted(cands)[0]
+        else:
+            # 後手: 相手底角に重ねず、別の空き底角を最優先
             try:
                 lx, ly, lz = last_move
-                if (lx,ly) in CORNERS and lz == 0:
-                    others = [mv for mv in corner0 if mv != (lx,ly)]
-                    if others:
-                        cands = safe_filter_moves(board, me, others) or others
-                        cands = _anti_cap_filter(cands)
-                        best = _choose_by_minimax_opp_after(board, me, cands, deadline, 12)
-                        if best is not None: return best
-                        return _center_sorted(cands)[0]
+                prefer = [mv for mv in corner0 if mv != (lx,ly)]
+                if prefer:
+                    cands = _anti_cap_filter(prefer)
+                else:
+                    cands = _anti_cap_filter(corner0)
             except Exception:
-                pass
-
-        cands = safe_filter_moves(board, me, corner0) or corner0
-        cands = _anti_cap_filter(cands)
-        best = _choose_by_minimax_opp_after(board, me, cands, deadline, 12)
-        if best is not None: return best
-        return _center_sorted(cands)[0]
+                cands = _anti_cap_filter(corner0)
+            cands = safe_filter_moves(board, me, cands) or cands
+            best = _choose_by_minimax_opp_after(board, me, cands, deadline, 12)
+            if best is not None: return best
+            return _center_sorted(cands)[0]
 
     # 4) 中央クランプ（z∈{1,2}）
     center_cands = [(x,y) for (x,y) in CENTERS
@@ -778,7 +767,7 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
         return best
     return _center_sorted(cands)[0]
 
-# ---------- Hard Block Gate ----------
+# ---------- Hard Block Gate（最後の安全弁） ----------
 def hard_block_gate(board: Board, me: int, proposed: Coord2, deadline: float) -> Coord2:
     legal = valid_xy_moves(board)
     if not legal:
@@ -790,36 +779,38 @@ def hard_block_gate(board: Board, me: int, proposed: Coord2, deadline: float) ->
         if _time_up(deadline):
             return proposed
 
+        # 自即勝は通す
         my_now = _opp_immediate_now_union(board, me)
         if proposed in my_now:
             return proposed
 
-        worst = _max_opp_immediate_after_reply(board, me, proposed[0], proposed[1], deadline, _beam_by_time(deadline, 14))
-        if worst >= 2:
-            safe = _choose_by_minimax_opp_after(board, me, legal, deadline, 14)
+        # 置いた後の相手即勝“最大値”が大なら差し替え
+        cur_worst = _max_opp_immediate_after_reply(board, me, proposed[0], proposed[1], deadline, _beam_by_time(deadline, 12))
+        if cur_worst >= 2:
+            safe = _choose_by_minimax_opp_after(board, me, legal, deadline, 12)
             if safe is not None:
                 proposed = safe
 
+        # 直ブロックの見落としを再確認
         opp_now = _opp_immediate_now_union(board, 3 - me)
         if opp_now:
             direct = [mv for mv in legal if mv in opp_now]
             if direct:
-                best = _choose_by_minimax_opp_after(board, me, direct, deadline, 14)
+                best = _choose_by_minimax_opp_after(board, me, direct, deadline, 12)
                 if best is not None:
                     return best
 
-        # アンチ重ね: 危険を下げられる非重ね手があれば置換
-        cur_worst = _max_opp_immediate_after_reply(board, me, proposed[0], proposed[1], deadline, _beam_by_time(deadline, 12))
+        # アンチ重ね：より安全な“非重ね”手に置換できるなら置換
         better: List[Coord2] = []
         for (x, y) in legal:
             if _time_up(deadline): break
             if is_cap_on_opponent_corner(board, me, x, y):
                 continue
-            w = _max_opp_immediate_after_reply(board, me, x, y, deadline, _beam_by_time(deadline, 12))
+            w = _max_opp_immediate_after_reply(board, me, x, y, deadline, _beam_by_time(deadline, 10))
             if w < cur_worst:
                 better.append((x, y))
         if better:
-            alt = _choose_by_minimax_opp_after(board, me, better, deadline, 12)
+            alt = _choose_by_minimax_opp_after(board, me, better, deadline, 10)
             if alt is not None:
                 proposed = alt
 
