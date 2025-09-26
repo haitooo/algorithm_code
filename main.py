@@ -1,11 +1,13 @@
 # main.py
 # 4x4x4 立体四目並べ AI — 角(z==0)強制優先 + 脅威空間(IDS) + 全76ライン評価 + 低深度AB
-# 方針:
-#  1) 即勝ち > 即ブロック（直/間接）> 角z==0（先手は必ず角 / 後手は重ねず別角）> 中央/縦圧 > 脅威限定探索(IDS)
-#  2) それでも不明なら、低深度のフルαβ(2〜3ply)で「ダブルリーチ/偶奇/中心」重視の評価で最終判断
-#  3) すべて安全フィルタを通し、失敗時も必ず合法手を返す
+# 変更点:
+#  (1) ブロック系(直/間接)と緊急縦クランプを角より優先
+#  (2) 「こちらが置いた直後の相手即勝数」を最小化する1手先ミニマックスを導入
+#  (3) force_block_guard の相手即勝ち検出を2系統の合併集合で強化
+#  (4) 縦クランプに z==3 直前(相手3個)も追加
+#  (5) 候補束/探索深さを拡大: THREAT_BEAM=16, TS_MAX_DEPTH=5
 #
-# 禁止API: 一切未使用（外部I/Oや乱数も不使用）。標準libの time と typing のみ。
+# 禁止API: すべて未使用（I/O・並列なし）。標準libの time / typing のみ。
 
 from typing import List, Tuple, Optional, Dict, Set
 import time
@@ -16,10 +18,10 @@ Coord3 = Tuple[int, int, int]
 SIZE = 4
 
 # ---- 探索予算 ----
-TIME_BUDGET_SEC = 9.5       # 全体持ち時間
-TS_MAX_DEPTH    = 4         # 脅威空間 IDS 深さ
-THREAT_BEAM     = 12        # 脅威候補束
-AB_MAX_DEPTH    = 3         # 最終保険のミニαβの最大深さ（軽量）
+TIME_BUDGET_SEC = 9.5       # 全体思考時間
+TS_MAX_DEPTH    = 5         # 脅威空間 IDS 深さ（拡大）
+THREAT_BEAM     = 16        # 脅威候補束（拡大）
+AB_MAX_DEPTH    = 3         # 最終保険のミニαβ最大深さ
 
 # ---------- 基本ユーティリティ ----------
 def lowest_empty_z(board: Board, x: int, y: int) -> Optional[int]:
@@ -104,6 +106,24 @@ def immediate_winning_squares_try(board: Board, player: int) -> List[Coord2]:
                 wins.append((ex, ey))
     return wins
 
+def line_immediate_winning_moves(board: Board, player: int) -> List[Coord2]:
+    you = 3 - player
+    wins: Set[Coord2] = set()
+    for line in ALL_LINES:
+        cnt_me = cnt_you = 0
+        empty: Optional[Coord3] = None
+        for (x, y, z) in line:
+            v = board[z][y][x]
+            if v == player: cnt_me += 1
+            elif v == you:  cnt_you += 1
+            else:           empty = (x, y, z)
+        if cnt_you == 0 and cnt_me == 3 and empty is not None:
+            ex, ey, ez = empty
+            ze = lowest_empty_z(board, ex, ey)
+            if ze is not None and ze == ez:
+                wins.add((ex, ey))
+    return list(wins)
+
 def is_winning_after(board: Board, player: int, x: int, y: int) -> bool:
     z = place_inplace(board, x, y, player)
     if z is None: return False
@@ -134,7 +154,7 @@ def first_layer_corner_moves(board: Board) -> List[Coord2]:
             mv.append((x,y))
     return mv
 
-# ---------- 側面テンプレ（逆ミッキー絡み） ----------
+# ---------- 側面テンプレ（逆ミッキー関連） ----------
 def sideview_required_cells_for_row(y_fixed: int) -> List[Coord3]:
     return [(0, y_fixed, 0), (3, y_fixed, 0),
             (1, y_fixed, 1), (2, y_fixed, 1),
@@ -155,9 +175,9 @@ def sideview_pattern_score_after_move(board: Board, me: int, x: int, y: int) -> 
     undo_place(board, x, y, z)
     return sc
 
-# ---------- 安全系（自殺・t支え・DT誘発） ----------
+# ---------- 安全系（自殺・t支え） ----------
 def is_t_support_move(board: Board, me: int, x: int, y: int) -> bool:
-    # z==2 で置くと相手のその列勝ち(=支え)になる危険
+    # z==2 に置くと、相手が同列に置いて z==3 で勝てる「支え」になる場合を避ける
     z = lowest_empty_z(board, x, y)
     if z != 2:
         return False
@@ -169,7 +189,7 @@ def is_t_support_move(board: Board, me: int, x: int, y: int) -> bool:
     return opens
 
 def is_suicide_move(board: Board, me: int, x: int, y: int) -> bool:
-    # 置いた直後に相手のDT>=2を許すなら危険。ただし自即勝は除外。
+    # 置いた直後に相手DT>=2になるなら危険（ただし自即勝は除く）
     if is_winning_after(board, me, x, y): return False
     z = place_inplace(board, x, y, me)
     if z is None: return True
@@ -185,7 +205,7 @@ def safe_filter_moves(board: Board, me: int, moves: List[Coord2]) -> List[Coord2
         safe.append((x,y))
     return safe if safe else moves
 
-# ---------- 角周りの補助 ----------
+# ---------- 角周り補助 ----------
 def row_col_corners_for_edge(x: int, y: int) -> List[Coord2]:
     cs: List[Coord2] = []
     if y == 0: cs += [(0,0),(3,0)]
@@ -217,11 +237,17 @@ def _score_direct_block(board: Board, me: int, mv: Coord2, opp_wins_now: List[Co
     return (blocked, my_next, tie)
 
 def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
+    # 自分が今すぐ勝てるならそのまま
     my_now = immediate_winning_squares_try(board, me)
     if my_now: return chosen
-    opp_set = set(immediate_winning_squares_try(board, 3-me))
+
+    # 相手の“今の”即勝ちを2系統の検出で合併
+    opp_now_a = set(immediate_winning_squares_try(board, 3-me))
+    opp_now_b = set(line_immediate_winning_moves(board, 3-me))
+    opp_set = opp_now_a | opp_now_b
     if not opp_set: return chosen
     if chosen in opp_set: return chosen
+
     moves = valid_xy_moves(board)
     direct = [mv for mv in moves if mv in opp_set]
     if direct:
@@ -255,14 +281,14 @@ def _tactical_eval(board: Board, me: int) -> int:
     my_now  = len(immediate_winning_squares_try(board, me))
     opp_now = len(immediate_winning_squares_try(board, you))
     score = 10000*(my_now - opp_now)
-    if my_now >= 2:  score += 1500      # 自DT
-    if opp_now >= 2: score -= 2000      # 相手DT
+    if my_now >= 2:  score += 1500
+    if opp_now >= 2: score -= 2000
     # 中央/縦圧
     for y in range(SIZE):
         for x in range(SIZE):
             mc, yc = vertical_profile(board, me, x, y)
             if mc >= 2 and yc == 0: score += 3
-            # 中央寄り配置を微加点
+            # 中央寄り微加点/減点
             s = 3 - int(abs(1.5-x)+abs(1.5-y))
             for z in range(SIZE):
                 v = board[z][y][x]
@@ -279,7 +305,7 @@ def _tactical_candidates(board: Board, turn: int, me: int) -> List[Coord2]:
     cands: Set[Coord2] = set()
     cands |= wins_turn
     cands |= wins_opp
-    # 中央/辺(2,3層)を軽く混ぜる
+    # 中央/辺(2,3層)を混ぜる
     for (x, y) in CENTERS:
         if (x, y) in moves and lowest_empty_z(board, x, y) in (1,2):
             cands.add((x,y))
@@ -290,7 +316,7 @@ def _tactical_candidates(board: Board, turn: int, me: int) -> List[Coord2]:
     if len(cands) < 6:
         for mv in _center_sorted(moves):
             cands.add(mv)
-            if len(cands) >= 8: break
+            if len(cands) >= 10: break
     ordered = list(cands)
     def _score(m: Coord2) -> Tuple[int,int,int]:
         x,y = m
@@ -343,7 +369,7 @@ def threat_space_best_move_iterative(board: Board, me: int, deadline: float) -> 
             undo_place(board, x, y, z)
             if sc > best_sc:
                 best_sc = sc; best_mv = (x, y)
-        # PV を先頭に
+        # PV先頭化
         if best_mv in root:
             root = [best_mv] + [m for m in root if m != best_mv]
     return best_mv
@@ -407,7 +433,7 @@ def alphabeta_global(board: Board, depth: int, alpha: int, beta: int, turn: int,
         z = place_inplace(board, x, y, turn)
         if z is None:
             continue
-        sc = -alphabeta_global(board, depth-1, -beta, -alpha, nxt, me, deadline)
+        sc = -alphabeta_global(board, depth-1, -10**9, 10**9, nxt, me, deadline)
         undo_place(board, x, y, z)
         if sc > best: best = sc
         if best > alpha: alpha = best
@@ -433,7 +459,81 @@ def ab_fallback_move(board: Board, me: int, deadline: float) -> Optional[Coord2]
         moves = [best_mv] + [m for m in moves if m != best_mv]
     return best_mv
 
-# ---------- メイン手選択 ----------
+# ---------- 緊急縦クランプ（改良: z==3直前も追加） ----------
+def opponent_focus_columns(board: Board, me: int) -> List[Coord2]:
+    you = 3 - me
+    stats: List[Tuple[int, int, Coord2]] = []
+    for y in range(SIZE):
+        for x in range(SIZE):
+            c_you = 0
+            for z in range(SIZE):
+                if board[z][y][x] == you:
+                    c_you += 1
+            if c_you > 0:
+                center = int(abs(1.5 - x) + abs(1.5 - y))
+                stats.append((c_you, -center, (x, y)))
+    stats.sort(reverse=True)
+    return [p for _,__,p in stats]
+
+def vertical_profile(board: Board, player: int, x: int, y: int) -> Tuple[int,int]:
+    you = 3 - player
+    c_me = c_you = 0
+    for z in range(SIZE):
+        v = board[z][y][x]
+        if v == player: c_me += 1
+        elif v == you:  c_you += 1
+    return c_me, c_you
+
+def urgent_vertical_clamp(board: Board, me: int) -> Optional[Coord2]:
+    moves = valid_xy_moves(board)
+    if not moves: return None
+    you = 3 - me
+
+    # ★追加: 相手が z==3 直前で3個揃う列（=置かれると即勝）を最優先
+    for (x, y) in moves:
+        z = lowest_empty_z(board, x, y)
+        if z == 3:
+            cnt_you = sum(1 for zz in range(3) if board[zz][y][x] == you)
+            if cnt_you == 3:
+                if (x, y) in safe_filter_moves(board, me, [(x, y)]):
+                    return (x, y)
+
+    # 既存: z==2,1 の縦圧抑止
+    focus = opponent_focus_columns(board, me)
+    focus_rank: Dict[Coord2, int] = {p:i for i,p in enumerate(focus)}
+    prio: List[Tuple[int, int, int, Coord2]] = []
+    for (x, y) in moves:
+        z = lowest_empty_z(board, x, y)
+        if z is None: continue
+        me_c, you_c = vertical_profile(board, me, x, y)
+        if you_c >= 2 and z == 2:
+            if (x, y) in safe_filter_moves(board, me, [(x, y)]):
+                prio.append((2, -focus_rank.get((x,y), 99), -int(abs(1.5-x)+abs(1.5-y)), (x, y)))
+        elif you_c == 1 and z == 1:
+            if (x, y) in safe_filter_moves(board, me, [(x, y)]):
+                prio.append((1, -focus_rank.get((x,y), 99), -int(abs(1.5-x)+abs(1.5-y)), (x, y)))
+    if not prio:
+        return None
+    prio.sort(reverse=True)
+    return prio[0][3]
+
+# ---------- 1手先の相手即勝最小化（新規） ----------
+def _minimize_opp_immediate_after(board: Board, me: int, moves: List[Coord2]) -> Optional[Coord2]:
+    if not moves: return None
+    you = 3 - me
+    best_mv = moves[0]; best_cnt = 10**9
+    for (x, y) in moves:
+        z = place_inplace(board, x, y, me)
+        if z is None: continue
+        cnt = len(immediate_winning_squares_try(board, you))
+        undo_place(board, x, y, z)
+        if cnt < best_cnt:
+            best_cnt = cnt; best_mv = (x, y)
+            if cnt == 0:
+                break
+    return best_mv
+
+# ---------- 手選択（改良順序） ----------
 def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Coord2:
     moves = valid_xy_moves(board)
     if not moves: return (0,0)
@@ -445,7 +545,7 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
             if mv in my_now: return mv
         return _center_sorted(my_now)[0]
 
-    # 2) 相手即勝ブロック
+    # 2) 相手即勝ブロック（直 / 間接）
     opp_now = immediate_winning_squares_try(board, 3-me)
     if opp_now:
         direct = [mv for mv in moves if mv in opp_now]
@@ -453,7 +553,6 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
             scored = [(_score_direct_block(board, me, mv, opp_now), mv) for mv in direct]
             scored.sort(key=lambda t: (t[0][0], t[0][1], t[0][2]), reverse=True)
             return scored[0][1]
-        # 間接
         best = None; best_after = 10**9
         for (x, y) in _center_sorted(moves):
             z = place_inplace(board, x, y, me)
@@ -465,26 +564,31 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
                 best_after = after; best = (x, y)
         if best is not None: return best
 
-    # 3) 角(z==0)強制優先
+    # 2.5) 緊急縦クランプ（角より前）
+    vb = urgent_vertical_clamp(board, me)
+    if vb is not None:
+        return vb
+
+    # 3) 角(z==0)強制優先（先手: 角必須 / 後手: 重ねず別角）
     corner0 = first_layer_corner_moves(board)
     if corner0:
-        # 後手は「重ねず別角」優先
         if me == 2:
             lx, ly, lz = last_move
             if (lx,ly) in CORNERS and lz == 0:
                 others = [(x, y) for (x, y) in corner0 if (x, y) != (lx, ly)]
                 if others:
                     cands = safe_filter_moves(board, me, others) or others
-                    return sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
+                    mv = _minimize_opp_immediate_after(board, me, cands) or sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
+                    return mv
         cands = safe_filter_moves(board, me, corner0) or corner0
-        return sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
+        mv = _minimize_opp_immediate_after(board, me, cands) or sorted(cands, key=lambda p: (abs(1.5-p[0])+abs(1.5-p[1])))[0]
+        return mv
 
     # 4) 中央クランプ（z∈{1,2}）
     center_cands = [(x,y) for (x,y) in CENTERS
                     if (x,y) in moves and lowest_empty_z(board,x,y) in (1,2)]
     center_cands = safe_filter_moves(board, me, center_cands)
     if center_cands:
-        # 相手の即勝ち数削減度でソート
         base = len(immediate_winning_squares_try(board, 3-me))
         scored = []
         for (x,y) in center_cands:
@@ -495,7 +599,9 @@ def choose_best(board: Board, me: int, deadline: float, last_move: Coord3) -> Co
             cbias = -int(abs(1.5-x)+abs(1.5-y))
             scored.append(((delta, cbias), (x,y)))
         scored.sort(key=lambda t: t[0], reverse=True)
-        return scored[0][1]
+        cands = [mv for _,mv in scored]
+        mv = _minimize_opp_immediate_after(board, me, cands) or cands[0]
+        return mv
 
     # 5) 辺(2,3層)で側面形を拡大（自列に角があるエッジ優先）
     edge_cands: List[Coord2] = []
