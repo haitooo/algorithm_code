@@ -338,6 +338,26 @@ def force_block_guard(board: Board, me: int, chosen: Coord2) -> Coord2:
             best_after = after; best = (x, y)
     return best if best is not None else (_center_sorted(moves)[0] if moves else (0,0))
 
+def opponent_focus_columns(board: Board, me: int) -> List[Coord2]:
+    """
+    相手石数が多い列(x,y)を降順で返す（同数なら中央寄り優先）。
+    “同じ列連打”への即応クランプ用。
+    """
+    you = 3 - me
+    stats: List[Tuple[int, int, Coord2]] = []  # (you_count, -center_score, (x,y))
+    for y in range(SIZE):
+        for x in range(SIZE):
+            c_me = c_you = 0
+            for z in range(SIZE):
+                v = board[z][y][x]
+                if v == me:  c_me  += 1
+                elif v == you: c_you += 1
+            if c_you > 0:  # 相手の石が入っている列のみ
+                center = int(abs(1.5 - x) + abs(1.5 - y))
+                stats.append((c_you, -center, (x, y)))
+    stats.sort(reverse=True)
+    return [p for _,__,p in stats]
+
 # ---------- 縦列クランプ（新規） ----------
 def vertical_profile(board: Board, player: int, x: int, y: int) -> Tuple[int,int]:
     """(player個数, 相手個数) in column (x,y)"""
@@ -350,33 +370,37 @@ def vertical_profile(board: Board, player: int, x: int, y: int) -> Tuple[int,int
     return c_me, c_you
 
 def urgent_vertical_clamp(board: Board, me: int) -> Optional[Coord2]:
-    """相手が縦で先行している列を安全に“上から”抑える。優先順: 相手2枚→z2ブロック > 相手1枚→z1ブロック。"""
     moves = valid_xy_moves(board)
     if not moves: return None
-    you = 3 - me
 
-    prio: List[Tuple[int, Coord2]] = []
+    focus = opponent_focus_columns(board, me)  # ★追加
+    focus_rank: Dict[Coord2, int] = {p:i for i,p in enumerate(focus)}  # 小さいほど重要
+
+    prio: List[Tuple[int, int, Coord2]] = []
     for (x, y) in moves:
         z = lowest_empty_z(board, x, y)
         if z is None: continue
         me_c, you_c = vertical_profile(board, me, x, y)
 
-        # 相手が2枚 already: z==2 を安全に埋めたい
+        # 相手2枚→z==2 を最優先で塞ぐ
         if you_c >= 2 and z == 2:
             if (x, y) in safe_filter_moves(board, me, [(x, y)]):
-                # スコア: 超高優先（2）
-                prio.append((2, (x, y)))
-        # 相手が1枚: z==1 を安全に先取りしたい
+                f = -focus_rank.get((x,y), 99)   # ★フォーカス補正
+                prio.append((2, f, (x, y)))
+        # 相手1枚→z==1 を早めに奪う
         elif you_c == 1 and z == 1:
             if (x, y) in safe_filter_moves(board, me, [(x, y)]):
-                # スコア: 高優先（1）
-                prio.append((1, (x, y)))
+                f = -focus_rank.get((x,y), 99)   # ★フォーカス補正
+                prio.append((1, f, (x, y)))
 
     if not prio:
         return None
-    # 高優先→中央寄りで選ぶ
-    prio.sort(key=lambda t: (t[0], - (abs(1.5 - t[1][0]) + abs(1.5 - t[1][1]))), reverse=True)
-    return prio[0][1]
+
+    # (優先種別, フォーカス補正, 中央寄り)の順で最適化
+    prio.sort(key=lambda t: (t[0], t[1],
+                             - (abs(1.5 - t[2][0]) + abs(1.5 - t[2][1]))),
+              reverse=True)
+    return prio[0][2]
 
 def build_own_vertical_pressure(board: Board, me: int) -> Optional[Coord2]:
     """自分がz=0を確保済みの列で、z==1 を安全に積んで圧を作る。"""
@@ -542,9 +566,15 @@ def threat_space_best_move_iterative(board: Board, me: int, deadline: float) -> 
     if not root_moves:
         return None
     root_moves = safe_filter_moves(board, me, root_moves)
+
+    # ★相手フォーカス列が強いほど深く読む（分岐が閉じるのでコスパ良）
+    focus = opponent_focus_columns(board, me)
+    extra = 1 if focus and len(focus) <= 4 else 0
+    max_d = min(TS_MAX_DEPTH + extra, 5)  # 上限5にセーフティ
+
     best_mv: Optional[Coord2] = root_moves[0]
     you = 3 - me
-    for d in range(2, TS_MAX_DEPTH+1):
+    for d in range(2, max_d+1):
         if time.perf_counter() >= deadline:
             break
         best_sc = -10**9
